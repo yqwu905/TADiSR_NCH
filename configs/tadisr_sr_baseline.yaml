@@ -96,7 +96,7 @@ components:
       pooled_projection_dim: 768
       guidance_embeds: false
       axes_dims_rope: [48, 168, 168]
-      processor_type: sparse
+      processor_type: default    # sparse requires >=1024 res; default for smoke
       ffn_ratio: 4
       adaln_dim: 1536
       layers_to_retained:

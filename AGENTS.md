@@ -283,6 +283,123 @@ PY
 - 先覆盖 `data.train.dataloader.num_workers=0`，把错误暴露到主进程。
 - 再逐步恢复 `num_workers`、`persistent_workers`、`prefetch_factor`。
 
+## Colab GPU 调试环境
+
+通过 [colab-mcp](https://github.com/googlecolab/colab-mcp) 可以把本地 opencode 桥接到 Google Colab 浏览器里的 GPU session，直接在 Colab kernel 中执行代码、编辑 notebook cell 并拿回输出，适合在没有本地 GPU 时做框架调试和 smoke 训练。
+
+### 工作机制
+
+1. opencode 通过 stdio 启动 `colab-mcp` server（`uvx` 自动拉取 Python 3.13+ 和依赖，与系统 Python 隔离）。
+2. server 在 `localhost:<随机端口>` 开一个 WebSocket，并暴露工具 `open_colab_browser_connection`。
+3. 调用该工具后会打开 `https://colab.research.google.com/notebooks/empty.ipynb#mcpProxyToken=<token>&mcpProxyPort=<port>`，Colab 前端连回本地 WS。
+4. 连接成功后，server 通过 MCP `notifications/tools/list_changed` 动态刷新工具集，解锁 notebook 编辑与 kernel 执行工具。
+
+### 前提条件
+
+- 本地已安装 `uv` / `uvx`（`pip install uv`）。
+- opencode 本地运行（MCP server 要求客户端在本机）。
+- 拥有 Google Colab 计算单元，可在 Colab 中使用 GPU runtime。
+- opencode 支持 `notifications/tools/list_changed`（已实测可用，尽管 colab-mcp 官方文档只列了 Gemini CLI / Claude Code / Windsurf）。
+
+### 配置方法
+
+在 `~/.config/opencode/opencode.jsonc`（全局）或项目级 `opencode.jsonc` 的 `mcp` 节点下添加：
+
+```jsonc
+{
+  "mcp": {
+    "colab-mcp": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "git+https://github.com/googlecolab/colab-mcp"
+      ],
+      "enabled": true,
+      "timeout": 60000
+    }
+  }
+}
+```
+
+首次启动时 `uvx` 会下载 colab-mcp 及其依赖（约 100 个包），后续从缓存启动较快。`timeout` 建议设为 60000ms 以上以容纳首次下载。
+
+### 连接流程
+
+1. 写入配置后**重启 opencode**，MCP server 仅在启动时加载。
+2. 浏览器打开 Colab，登录账号。
+3. 在 opencode 中调用 `open_colab_browser_connection`，会自动弹出带 token 的 Colab 标签页。
+4. 在 Colab 中手动选择 GPU runtime：**Runtime → Change runtime type → Hardware accelerator → T4 / A100 / L4 → Save**。runtime type 属于 Colab UI 层设置，不暴露给 kernel，无法通过代码切换。
+5. 切换 runtime 后 kernel 会重连，cell 内容保留；重新执行环境检查 cell 确认 GPU 可用。
+
+### 可用工具
+
+连接成功后可使用以下 notebook 操作工具：
+
+| 工具 | 功能 |
+|------|------|
+| `add_code_cell` | 在指定 index 插入代码 cell（支持 python / r / julia） |
+| `add_text_cell` | 在指定 index 插入 Markdown cell |
+| `get_cells` | 读取 cell 范围（可选包含执行输出） |
+| `run_code_cell` | 执行指定 code cell 并返回输出 |
+| `update_cell` | 覆盖 cell 内容 |
+| `move_cell` | 移动 cell 到指定 index |
+| `delete_cell` | 删除指定 cell |
+
+### 实测环境参考
+
+在 Colab GPU runtime 下实测（2026-06）：
+
+- GPU: NVIDIA L4，23.5 GB 显存
+- torch: 2.11.0+cu128，CUDA 12.8，driver 580.82.07
+- Python: 3.12.13，Linux x86_64
+
+### 在 Colab 中调试本框架
+
+在 Colab kernel 中克隆仓库并安装依赖后即可运行框架的调试命令：
+
+```python
+# 克隆仓库
+import subprocess
+subprocess.run(["git", "clone", "<repo_url>", "/content/TADiSR_NCH"], check=True)
+
+# 安装依赖
+subprocess.run(["pip", "install", "-e", "/content/TADiSR_NCH"], check=True)
+
+# 语法检查
+subprocess.run(
+    ["python3", "-m", "compileall", "-q", "framework", "test_assets", "tests"],
+    cwd="/content/TADiSR_NCH", check=True
+)
+
+# smoke 测试
+subprocess.run(
+    ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+    cwd="/content/TADiSR_NCH", check=True
+)
+```
+
+单卡 GPU 调试训练时，覆盖 DDP 配置：
+
+```bash
+python -m framework.train \
+  --config configs/f16c64_vae_dit_proj_out_align.yaml \
+  runtime.distributed.strategy=none \
+  runtime.device=cuda \
+  train.max_steps=2 \
+  train.log_every=1 \
+  data.train.dataloader.num_workers=0
+```
+
+注意：示例训练配置引用了已删除的业务实现（`models.*`、`network.*`、`data.*`），补回这些模块前训练命令会在 import 或配置加载处失败。Colab 环境适合做框架层语法检查、配置解析验证、组件构建验证和 op/loss 注册检查。
+
+### 注意事项
+
+- **单连接排他**：WebSocket server 同一时刻只接受一个 Colab 连接，已有连接时新连接会被拒绝（1013）。
+- **kernel 生命周期**：Colab 免费或计算单元 session 有空闲超时，长时间不操作会断开；断连后需重新调用 `open_colab_browser_connection`。
+- **runtime 切换会重连**：切换 hardware accelerator 后 kernel 重启，所有运行时变量丢失，需重新执行初始化 cell。
+- **文件持久性**：Colab `/content` 目录在 session 结束后清空，clone 的代码和安装的包需要重新准备。需要持久化的 checkpoint 或日志应下载或挂载 Google Drive。
+- **不支持多卡 DDP**：Colab 单 session 只有一张 GPU，`runtime.distributed.strategy` 应设为 `none`。
+
 ## 当前已知状态
 
 - `README.md` 为空，`AGENTS.md` 是当前主要项目说明入口。

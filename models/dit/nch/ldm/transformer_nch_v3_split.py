@@ -387,7 +387,7 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
     def unrearrange(self, hidden_states, bs, c, h, w, patch_size):
         c = c // (patch_size * patch_size)
         hidden_states = hidden_states.reshape(bs, h // patch_size, w // patch_size, c, patch_size, patch_size)
-        hidden_states = hidden_states.reshape(bs, h // patch_size * w // patch_size, c, patch_size, patch_size)
+        hidden_states = hidden_states.reshape(bs, h // patch_size * w // patch_size, c, patch_size * patch_size)
         hidden_states = hidden_states.permute(0, 2, 1, 3).reshape(bs * c * h // patch_size, w // patch_size, patch_size, patch_size)
         hidden_states = hidden_states.permute(0, 2, 1, 3).reshape(bs, c, h // patch_size, patch_size, w // patch_size, patch_size)
         hidden_states = hidden_states.reshape(bs, c, h, w)
