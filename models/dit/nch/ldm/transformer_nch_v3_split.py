@@ -315,6 +315,8 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         taca_cfg = taca_cfg or {}
         self.taca_layers = list(taca_cfg.get("taca_layers", []))
         self.taca_text_token_indices = list(taca_cfg.get("text_token_indices", []))
+        self.taca_query_chunk_size = int(taca_cfg.get("query_chunk_size", 1024))
+        self.taca_use_checkpoint = bool(taca_cfg.get("use_checkpoint", True))
         self.taca = None
         if taca_cfg.get("enabled", False) and self.taca_layers and self.taca_text_token_indices:
             from .taca import TACAProjection
@@ -571,18 +573,27 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             torch.save(encoder_hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_encoder_hidden_state_in.pt")
             torch.save(hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_hidden_state_in.pt")
         
-        # TACA: enable attention-weight harvesting on selected blocks.
+        # TACA: enable attention-slice extraction on selected blocks.
         extracting = extract_a_tex and self.taca is not None
+        text_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
         for block in self.transformer_blocks:
+            block.attn.taca_config = None
+            block.attn.taca_slice = None
             block.attn.store_attn_weights = False
             block.attn.last_attn_weights = None
         taca_layers_set = set()
         if extracting:
             taca_layers_set = set(self.taca_layers)
+            taca_block_cfg = {
+                "text_seq_len": text_seq_len,
+                "text_token_indices": self.taca_text_token_indices,
+                "query_chunk_size": self.taca_query_chunk_size,
+                "use_checkpoint": self.taca_use_checkpoint,
+            }
             for li in self.taca_layers:
                 if li < len(self.transformer_blocks):
-                    self.transformer_blocks[li].attn.store_attn_weights = True
-        collected_weights = [] if extracting else None
+                    self.transformer_blocks[li].attn.taca_config = taca_block_cfg
+        collected_slices = [] if extracting else None
 
         features = []
         for index_block, block in enumerate(self.transformer_blocks):
@@ -625,11 +636,11 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
 
-            # TACA: harvest attention weights from selected blocks.
-            if collected_weights is not None and index_block in taca_layers_set:
-                attn_w = block.attn.last_attn_weights
-                if attn_w is not None:
-                    collected_weights.append(attn_w)
+            # TACA: harvest attention slices from selected blocks.
+            if collected_slices is not None and index_block in taca_layers_set:
+                s = block.attn.taca_slice
+                if s is not None:
+                    collected_slices.append(s)
 
             # controlnet residual
             if controlnet_block_samples is not None:
@@ -646,16 +657,11 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 ori_hidden_states = hidden_states.reshape(bs*new_H, new_W, block_lenth_2D, -1).transpose(1, 2).reshape(bs, new_img_len, -1)
                 features.append(ori_hidden_states)
 
-        # TACA: project harvested attention weights into a_tex.
+        # TACA: project harvested attention slices into a_tex.
         a_tex = None
-        if collected_weights is not None and self.taca is not None:
-            if len(collected_weights) == len(self.taca_layers):
-                text_seq_len = encoder_hidden_states.shape[1]
-                a_tex = self.taca(
-                    collected_weights,
-                    self.taca_text_token_indices,
-                    text_seq_len,
-                )
+        if collected_slices is not None and self.taca is not None:
+            if len(collected_slices) == len(self.taca_layers):
+                a_tex = self.taca(collected_slices)
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 

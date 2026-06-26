@@ -21,12 +21,13 @@ from torch import nn
 class TACAProjection(nn.Module):
     """Text-Aware Cross Attention projection head.
 
-    For each collected DiT block the attention weight tensor has shape
-    ``[B, H, S, S]`` with ``S = text_seq_len + img_seq_len`` and text tokens
-    occupying the first ``text_seq_len`` positions. The rows of the text
-    tokens (restricted to the image columns) are extracted, flattened over
-    heads and text tokens, concatenated across layers, and linearly
-    projected to ``a_tex`` of shape ``[B, img_seq_len, out_dim]``.
+    For each collected DiT block the attention processor pre-extracts an
+    image→text attention slice of shape ``[B, H, S_img, n_text]`` — the
+    softmax probability of every image patch attending to the selected
+    text tokens — via a chunked logsumexp side path that avoids
+    materializing the full ``[B, H, S, S]`` weight matrix. The slices are
+    flattened over heads and text tokens, concatenated across layers, and
+    linearly projected to ``a_tex`` of shape ``[B, img_seq_len, out_dim]``.
 
     Parameters
     ----------
@@ -67,48 +68,33 @@ class TACAProjection(nn.Module):
         if self.proj.bias is not None:
             nn.init.zeros_(self.proj.bias)
 
-    def forward(
-        self,
-        attn_weights_list: List[torch.Tensor],
-        text_token_indices: Sequence[int],
-        text_seq_len: int,
-    ) -> torch.Tensor:
-        """Project multi-layer attention weights into ``a_tex``.
+    def forward(self, slices: List[torch.Tensor]) -> torch.Tensor:
+        """Project pre-extracted text-attention slices into ``a_tex``.
 
         Parameters
         ----------
-        attn_weights_list : list of Tensor
-            Each tensor has shape ``[B, H, S, S]`` where
-            ``S = text_seq_len + img_seq_len``. Text tokens occupy the first
-            ``text_seq_len`` positions.
-        text_token_indices : sequence of int
-            Indices (within the text portion) of the text tokens to extract.
-        text_seq_len : int
-            Length of the text portion at the front of the attention seq.
+        slices : list of Tensor
+            Each tensor has shape ``[B, H, S_img, n_text]`` — the
+            image→text attention probabilities for every image patch
+            towards the selected text tokens, pre-extracted by the
+            attention processor via chunked logsumexp.
 
         Returns
         -------
         Tensor
-            ``a_tex`` of shape ``[B, img_seq_len, out_dim]``.
+            ``a_tex`` of shape ``[B, S_img, out_dim]``.
         """
-        if len(attn_weights_list) != self.num_layers:
+        if len(slices) != self.num_layers:
             raise ValueError(
                 f"TACAProjection expected {self.num_layers} attention "
-                f"weight tensors, got {len(attn_weights_list)}"
+                f"slices, got {len(slices)}"
             )
 
-        idx = torch.as_tensor(list(text_token_indices), dtype=torch.long)
-        idx = idx.to(attn_weights_list[0].device)
-
         feats = []
-        for weights in attn_weights_list:
-            # weights: [B, H, S, S]; image columns start at text_seq_len
-            img_cols = weights[:, :, :, text_seq_len:]  # [B, H, S, S_img]
-            # text-token rows -> [B, H, n_text, S_img]
-            rows = img_cols.index_select(2, idx)
-            # -> [B, S_img, H, n_text] -> [B, S_img, H*n_text]
-            rows = rows.permute(0, 3, 1, 2).contiguous()
-            feats.append(rows.view(rows.shape[0], rows.shape[1], -1))
+        for s in slices:
+            # s: [B, H, S_img, n_text] -> [B, S_img, H, n_text] -> [B, S_img, H*n_text]
+            s = s.permute(0, 2, 1, 3).contiguous()
+            feats.append(s.view(s.shape[0], s.shape[1], -1))
 
         concat = torch.cat(feats, dim=-1)  # [B, S_img, L*H*n_text]
         a_tex = self.proj(concat)  # [B, S_img, out_dim]

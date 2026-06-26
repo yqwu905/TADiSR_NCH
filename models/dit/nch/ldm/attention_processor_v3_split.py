@@ -321,11 +321,15 @@ class Attention(nn.Module):
             )
         self.set_processor(processor)
 
-        # TACA: when True, processors compute attention with an explicit
-        # softmax + matmul (instead of the fused SDPA kernel) and cache the
-        # resulting attention weights in ``last_attn_weights`` so they can be
-        # harvested by the TACA projection head. Default False keeps the
-        # fused SDPA kernel for the SR baseline path.
+        # TACA: when ``taca_config`` is set on the Attention module, the
+        # NCHAttnProcessor2_0 computes a chunked logsumexp text-attention
+        # slice (image→text direction) alongside the fused SDPA main path
+        # and caches it in ``taca_slice``. This avoids materializing the
+        # full attention weight matrix. ``store_attn_weights`` /
+        # ``last_attn_weights`` remain for the legacy full-matrix path
+        # used by SparseAttnProcessor.
+        self.taca_config = None
+        self.taca_slice = None
         self.store_attn_weights = False
         self.last_attn_weights = None
 
@@ -930,6 +934,94 @@ class NCHAttnProcessor2_0:
                 "NCHAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
             )
 
+    @staticmethod
+    def _slice_mask_for_taca(attention_mask, text_seq_len, start, end):
+        """Slice the query dimension of ``attention_mask`` for one chunk."""
+        if attention_mask is None:
+            return None
+        s_q = attention_mask.shape[-2]
+        lo = text_seq_len + start
+        hi = text_seq_len + end
+        if s_q < hi:
+            return attention_mask
+        return attention_mask[..., lo:hi, :]
+
+    @staticmethod
+    def _taca_chunk(q_chunk, key, idx, scale, mask_chunk=None):
+        """Compute image->text attention probs for one query chunk.
+
+        Returns ``[B, H, chunk, n_text]`` softmax probabilities, numerically
+        equivalent to slicing the full softmax matrix but without
+        materializing it.
+        """
+        scores = torch.matmul(q_chunk.float(), key.float().transpose(-1, -2)) * scale
+        if mask_chunk is not None:
+            if mask_chunk.dtype == torch.bool:
+                scores = scores.masked_fill(mask_chunk.logical_not(), float("-inf"))
+            else:
+                scores = scores + mask_chunk.float()
+        log_denom = torch.logsumexp(scores, dim=-1, keepdim=True)
+        text_scores = scores.index_select(-1, idx)
+        text_probs = torch.exp(text_scores - log_denom)
+        return text_probs.to(dtype=q_chunk.dtype)
+
+    def _extract_taca_slice(self, query, key, taca_cfg, attention_mask, scale):
+        """Extract image->text attention slice via chunked logsumexp.
+
+        Parameters
+        ----------
+        query, key : Tensor
+            ``[B, H, S_all, d]`` where ``S_all = S_text + S_img`` and text
+            tokens occupy the first ``S_text`` positions.
+        taca_cfg : dict
+            Keys: ``text_seq_len``, ``text_token_indices``,
+            ``query_chunk_size``, ``use_checkpoint``.
+        attention_mask : Tensor or None
+            Optional attention mask for the query dimension.
+        scale : float
+            Attention scale factor (``head_dim ** -0.5``).
+
+        Returns
+        -------
+        Tensor
+            ``[B, H, S_img, n_text]`` image->text attention probabilities.
+        """
+        text_seq_len = int(taca_cfg["text_seq_len"])
+        text_token_indices = list(taca_cfg["text_token_indices"])
+        chunk_size = int(taca_cfg.get("query_chunk_size", 0)) or query.shape[2]
+        use_ckpt = bool(taca_cfg.get("use_checkpoint", True))
+
+        q_img = query[:, :, text_seq_len:, :]
+        s_img = q_img.shape[2]
+        idx = torch.as_tensor(
+            text_token_indices, dtype=torch.long, device=key.device
+        )
+
+        chunks = []
+        for start in range(0, s_img, chunk_size):
+            end = min(start + chunk_size, s_img)
+            q_chunk = q_img[:, :, start:end, :]
+            mask_chunk = self._slice_mask_for_taca(
+                attention_mask, text_seq_len, start, end
+            )
+            if (
+                use_ckpt
+                and torch.is_grad_enabled()
+                and q_chunk.requires_grad
+            ):
+                chunk = torch.utils.checkpoint.checkpoint(
+                    self._taca_chunk,
+                    q_chunk, key, idx, scale, mask_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk = self._taca_chunk(
+                    q_chunk, key, idx, scale, mask_chunk
+                )
+            chunks.append(chunk)
+
+        return torch.cat(chunks, dim=2)
+
     def __call__(
         self,
         attn: Attention,
@@ -993,8 +1085,18 @@ class NCHAttnProcessor2_0:
             query = apply_rotary_emb_qwen_ruduan(query, new_cos, new_sin)
             key = apply_rotary_emb_qwen_ruduan(key, new_cos, new_sin)
 
-        if getattr(attn, "store_attn_weights", False):
-            # Manual attention to expose weights for TACA extraction.
+        taca_cfg = getattr(attn, "taca_config", None)
+        if taca_cfg is not None:
+            # Main path: fused SDPA (unchanged from baseline).
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
+            # Side path: chunked logsumexp extract image->text attention slice.
+            attn.taca_slice = self._extract_taca_slice(
+                query, key, taca_cfg, attention_mask, attn.scale
+            )
+        elif getattr(attn, "store_attn_weights", False):
+            # Legacy full-matrix path (kept for SparseAttnProcessor).
             attn_weights = torch.matmul(query, key.transpose(-1, -2)) * attn.scale
             if attention_mask is not None:
                 if attention_mask.dtype == torch.bool:
