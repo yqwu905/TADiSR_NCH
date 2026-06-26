@@ -7,7 +7,6 @@ Usage (run with pangu model + tokenizer available):
         --vlm_model_path /path/to/vlm_model \
         --vlm_llm_path /path/to/llm \
         --vlm_vit_path /path/to/vit \
-        --vocab_file /path/to/spiece.model \
         --prompt "A high-quality photo with clear text" \
         --task_tokens dehalo
 
@@ -24,7 +23,6 @@ def main():
     parser.add_argument("--vlm_model_path", type=str, required=True)
     parser.add_argument("--vlm_llm_path", type=str, required=True)
     parser.add_argument("--vlm_vit_path", type=str, required=True)
-    parser.add_argument("--vocab_file", type=str, required=True)
     parser.add_argument("--prompt", type=str,
                         default="A high-quality photo with clear text")
     parser.add_argument("--task_tokens", type=str, default=None)
@@ -33,12 +31,21 @@ def main():
 
     import torch
 
-    # Adjust these imports to your pangu installation
+    # Adjust this import to your pangu installation
     from models.pangu_vl_1B_v1.inference_und import initialize_model
-    from models.tokenizer.pangu_tokenizer import PanguTokenizer
 
-    # --- Tokenizer ---
-    tokenizer = PanguTokenizer(vocab_file=args.vocab_file)
+    # --- Initialize pangu model (returns InterleaveInferencer) ---
+    print("[info] initializing pangu model (this may take a while)...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    inferencer = initialize_model(
+        model_path=args.vlm_model_path,
+        llm_path=args.vlm_llm_path,
+        vit_path=args.vlm_vit_path,
+        device=device.index if device.type == "cuda" else 0,
+    )
+
+    tokenizer = inferencer.tokenizer
+    new_token_ids = inferencer.new_token_ids
 
     # --- Task token prefix (mirrors EmbeddingDB logic) ---
     task_prefix = ""
@@ -68,19 +75,6 @@ def main():
         if args.keyword.lower() in tok.lower():
             keyword_raw_indices.append(i)
     print(f"[info] '{args.keyword}' raw token indices: {keyword_raw_indices}")
-
-    # --- Initialize pangu model ---
-    print("[info] initializing pangu model...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    inferencer = initialize_model(
-        model_path=args.vlm_model_path,
-        llm_path=args.vlm_llm_path,
-        vit_path=args.vlm_vit_path,
-        device=device.index if device.type == "cuda" else 0,
-    )
-
-    # new_token_ids lives on the model, not the inferencer
-    new_token_ids = inferencer.new_token_ids
 
     # --- Run prepare_prompts to get packed_text_ids ---
     gen_context = {
@@ -120,7 +114,7 @@ def main():
                 print(f"    [{m:3d}] id={ids_seq[m]} token={tok!r}")
             print("\n[usage] Set these indices as taca.text_token_indices in the training config.")
         else:
-            # Try partial matching: check if any keyword token is a substring of other tokens
+            # Try partial matching
             print(f"[warn] no exact match; trying partial substring match...")
             keyword_str = args.keyword.lower()
             partial_matches = []
@@ -136,28 +130,15 @@ def main():
                 for m in partial_matches:
                     print(f"    [{m[0]:3d}] id={m[1]} token={m[2]!r}")
             else:
-                print("\n[info] No 'text' token found in packed_text_ids.")
-                print("    This is expected if pangu uses a subword tokenizer that splits 'text'")
-                print("    differently. Check raw tokenization output above for the actual keyword")
-                print(f"    token id ({raw_ids[keyword_raw_indices[0]] if keyword_raw_indices else 'N/A'}).")
-                print("    You can manually search for this ID in the packed sequence.")
+                print(f"\n[info] No 'text' token found in packed_text_ids.")
+                print(f"    Check raw tokenization for actual keyword token id ({raw_ids[keyword_raw_indices[0]] if keyword_raw_indices else 'N/A'}).")
     else:
-        # Fallback: run encode_prompts and use prefix-based position estimation
-        print("[warn] packed_text_ids not found. Running encode_prompts...")
-        from copy import deepcopy
-        ctx = deepcopy(gen_context)
-        prompt_embeds = inferencer.encode_prompts([full_prompt])
-        print(f"[info] encode_prompts output shape: {prompt_embeds.shape}")
-
-        # Estimate position: task_prefix tokens + system prompt + special tokens
+        print("[warn] packed_text_ids not found. Use offset estimation.")
         task_len = len(tokenizer.encode(task_prefix, add_special_tokens=False)) if task_prefix else 0
         prompt_len = len(raw_ids)
-        estimated_offset = 0  # need to know the system prompt length
         print(f"\n[info] raw prompt length: {prompt_len} tokens (incl. task_prefix: {task_len})")
-        print(f"    The 256 sequence includes system prompt + special tokens before the prompt.")
-        print(f"    The keyword's position = offset + {keyword_raw_indices}")
-        print(f"\n    To find the exact offset, inspect prepare_prompts source or")
-        print(f"    re-run with packed_text_ids exposed.")
+        print(f"    Keyword position in 256 sequence = system_prompt_offset + {keyword_raw_indices}")
+        print(f"    Determine offset by inspecting prepare_prompts source.")
 
 
 if __name__ == "__main__":
