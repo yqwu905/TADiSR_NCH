@@ -1,0 +1,7 @@
+target: network.nch_ldm_v3.NCH_LDM_V3
+params:
+  input_type: noise_one_lq
+  timesteps: [1.0]
+  enable_skip_level: '60'
+  model_cfg_path: configs/model_config/SR_nch_v3_ti2i_with_guidance_f16c64.yaml
+  base_model_ckpt_path: new_x_embedder_merge.pth

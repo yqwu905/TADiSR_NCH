@@ -1,0 +1,167 @@
+experiment:
+  name: f16c64_vae_dit_proj_out_align
+  output_dir: output/f16c64_vae_dit_proj_out_align
+
+imports:
+  data.train.dataset: configs/data_config/0612_deflare_1k_filtered.yaml
+  components.dit: configs/network_config/ldm_nch_v3.yaml
+  components.offline_embedding: configs/model_config/text_encoder/offline_embedding.yaml
+
+runtime:
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+  distributed:
+    strategy: ddp
+
+train:
+  max_steps: 100000
+  log_every: 10
+
+data:
+  train:
+    dataloader:
+      batch_size: 1
+      shuffle: true
+      num_workers: 4
+
+components:
+  vae_encoder:
+    target: models.vae.npu.f16c64.VaeEncoder
+    params:
+      z_channels: 64
+      resolution: 256
+    checkpoint: /home/models/NCH/vae/npu/f16c64-mj-ft_1-ckpt-4000.pt
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+  vae_decoder:
+    target: models.vae.npu.f16c64.VaeDecoder
+    params:
+      z_channels: 64
+      resolution: 256
+    checkpoint: /home/models/NCH/vae/npu/f16c64-mj-ft_1-ckpt-4000.pt
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+  offline_embedding:
+    params:
+      task_tokens: dehalo
+  dit:
+    checkpoint: /home/w00906749/01_NCH/04_FutureTrainer/new_x_embedder_merge.pth
+    strict: False
+    train:
+      strategy: keep
+    mode: train
+    save: full
+
+optimizers:
+  dit_optim:
+    type: adamw
+    lr: 1.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - dit
+
+losses:
+  deflare:
+    target: models.loss.flare7pp_loss.Flare7KPlusMaskLossV2
+    params:
+      w_clean_l1: 0.5
+      w_flare_l1: 0.0
+      w_clean_lpips: 0.5
+      w_flare_lpips: 0.0
+      w_clean_masked_l1: 0.5
+      w_flare_masked_l1: 0.0
+      w_flare_focal: 0.0
+    inputs:
+      flare: batch.flare
+      x: batch.lq
+      gt: batch.gt
+      pred: pred.rgb
+    weight: 1.0
+
+train_program:
+  phases:
+    - name: generator
+      trainable: [dit]
+      zero_grad: [dit_optim]
+      backward: true
+      step: [dit_optim]
+      ops:
+        vae_encode:
+          component: vae_encoder
+          inputs:
+            x: batch.lq
+          outputs:
+            latent: pred.latent
+        text_encode:
+          component: offline_embedding
+          method: get_embedding
+          inputs:
+            text: batch.prompt
+            model_id:
+              type: const
+              value: pangu_1b_vl
+          outputs:
+            encoder_hidden_states: encoder_hidden_states
+        dit:
+          component: dit
+          inputs:
+            hidden_states: pred.latent
+            encoder_hidden_states: encoder_hidden_states
+          outputs:
+            out: pred.dit_out
+        vae_decode:
+          component: vae_decoder
+          inputs:
+            x: pred.dit_out
+          outputs:
+            recon: pred.rgb
+      losses:
+        - deflare
+
+logging:
+  reduce_metrics: true
+  backends:
+    tensorboard:
+      enabled: true
+      log_dir: null
+    aim:
+      enabled: false
+      repo: null
+      experiment: null
+    wandb:
+      enabled: false
+      project: null
+      name: null
+  images:
+    enabled: true
+    every_n_steps: 100
+    max_images: 4
+    items:
+      - tag: image/lq
+        key: batch.lq
+        value_range: "-1_1"
+
+      - tag: image/pred
+        key: pred.rgb
+        value_range: "-1_1"
+
+      - tag: image/gt
+        key: batch.gt
+        value_range: "-1_1"
+
+profiling:
+  enabled: false
+  log_every: 1
+  synchronize: true
+  reduce: max
+
+checkpoint:
+  save_every_steps: 1000
+  keep_last: 5
+  save_optimizer: true
+  save_scheduler: true

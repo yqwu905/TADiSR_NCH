@@ -1,0 +1,87 @@
+experiment:
+  output_dir: /tmp/fictional-fortnight-smoke
+
+runtime:
+  device: cpu
+  mixed_precision: no
+  distributed:
+    strategy: none
+
+data:
+  train:
+    dataset:
+      target: test_assets.data.LinearRegressionDataset
+      params:
+        length: 16
+        input_dim: 4
+        output_dim: 2
+        seed: 7
+    dataloader:
+      batch_size: 4
+      shuffle: false
+      num_workers: 0
+      drop_last: false
+
+components:
+  regressor:
+    target: test_assets.models.TinyRegressor
+    params:
+      input_dim: 4
+      hidden_dim: 8
+      output_dim: 2
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+optimizers:
+  main:
+    type: adam
+    lr: 0.01
+    params:
+      include:
+        - regressor.trainable
+
+losses:
+  mse:
+    target: test_assets.losses.RegressionMSELoss
+    weight: 1.0
+    inputs:
+      prediction: pred.value
+      target: batch.target
+
+train:
+  max_steps: 3
+  max_epochs: 2
+  log_every: 1
+
+checkpoint:
+  save_every_steps: 0
+  save_optimizer: true
+  save_scheduler: true
+
+logging:
+  reduce_metrics: false
+  tensorboard:
+    enabled: false
+
+train_program:
+  phases:
+    - name: regression
+      trainable:
+        - regressor
+      zero_grad:
+        - main
+      ops:
+        forward_regressor:
+          component: regressor
+          inputs:
+            x: batch.input
+          outputs:
+            prediction: pred.value
+            mean_prediction: pred.mean
+      losses:
+        - mse
+      backward: true
+      step:
+        - main

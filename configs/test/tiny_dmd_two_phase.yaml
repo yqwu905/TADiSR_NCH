@@ -1,0 +1,190 @@
+experiment:
+  output_dir: /tmp/fictional-fortnight-dmd-smoke
+
+runtime:
+  device: cpu
+  mixed_precision: no
+  distributed:
+    strategy: none
+
+data:
+  train:
+    dataset:
+      target: test_assets.data.LinearRegressionDataset
+      params:
+        length: 16
+        input_dim: 4
+        output_dim: 2
+        seed: 13
+    dataloader:
+      batch_size: 4
+      shuffle: false
+      num_workers: 0
+      drop_last: false
+
+components:
+  generator:
+    target: test_assets.models.TinyRegressor
+    params:
+      input_dim: 4
+      hidden_dim: 8
+      output_dim: 2
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+  discriminator:
+    target: test_assets.models.TinyRegressor
+    params:
+      input_dim: 2
+      hidden_dim: 8
+      output_dim: 1
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+optimizers:
+  generator:
+    type: adam
+    lr: 0.01
+    params:
+      include:
+        - generator.trainable
+
+  discriminator:
+    type: adam
+    lr: 0.01
+    params:
+      include:
+        - discriminator.trainable
+
+losses:
+  generator_reconstruction:
+    target: test_assets.losses.RegressionMSELoss
+    weight: 0.25
+    inputs:
+      prediction: dmd.fake
+      target: batch.target
+
+  generator_dmd:
+    target: test_assets.losses.RegressionMSELoss
+    weight: 1.0
+    inputs:
+      prediction: dmd.fake_score_for_generator
+      target: dmd.real_label_for_generator
+
+  discriminator_real:
+    target: test_assets.losses.RegressionMSELoss
+    weight: 1.0
+    inputs:
+      prediction: dmd.real_score
+      target: dmd.real_label
+
+  discriminator_fake:
+    target: test_assets.losses.RegressionMSELoss
+    weight: 1.0
+    inputs:
+      prediction: dmd.fake_score
+      target: dmd.fake_label
+
+train:
+  max_steps: 3
+  max_epochs: 2
+  log_every: 1
+
+checkpoint:
+  save_every_steps: 0
+  save_optimizer: true
+  save_scheduler: true
+
+logging:
+  reduce_metrics: false
+  tensorboard:
+    enabled: false
+
+train_program:
+  phases:
+    - name: generator
+      trainable:
+        - generator
+      frozen:
+        - discriminator
+      zero_grad:
+        - generator
+      ops:
+        generate_fake:
+          component: generator
+          inputs:
+            x: batch.input
+          outputs:
+            prediction: dmd.fake
+            mean_prediction: dmd.fake_mean
+        score_fake_for_generator:
+          component: discriminator
+          inputs:
+            x: dmd.fake
+          outputs:
+            prediction: dmd.fake_score_for_generator
+            mean_prediction: dmd.fake_score_mean_for_generator
+        generator_real_label:
+          type: make_tensor
+          mode: ones_like
+          ref: dmd.fake_score_for_generator
+          output: dmd.real_label_for_generator
+      losses:
+        - generator_reconstruction
+        - generator_dmd
+      backward: true
+      step:
+        - generator
+
+    - name: discriminator
+      trainable:
+        - discriminator
+      frozen:
+        - generator
+      zero_grad:
+        - discriminator
+      ops:
+        generate_fake_for_discriminator:
+          component: generator
+          no_grad: true
+          inputs:
+            x: batch.input
+          outputs:
+            prediction: dmd.fake_for_discriminator
+            mean_prediction: dmd.fake_mean_for_discriminator
+        score_real:
+          component: discriminator
+          inputs:
+            x: batch.target
+          outputs:
+            prediction: dmd.real_score
+            mean_prediction: dmd.real_score_mean
+        score_fake:
+          component: discriminator
+          detach_inputs:
+            - x
+          inputs:
+            x: dmd.fake_for_discriminator
+          outputs:
+            prediction: dmd.fake_score
+            mean_prediction: dmd.fake_score_mean
+        discriminator_real_label:
+          type: make_tensor
+          mode: ones_like
+          ref: dmd.real_score
+          output: dmd.real_label
+        discriminator_fake_label:
+          type: make_tensor
+          mode: zeros_like
+          ref: dmd.fake_score
+          output: dmd.fake_label
+      losses:
+        - discriminator_real
+        - discriminator_fake
+      backward: true
+      step:
+        - discriminator

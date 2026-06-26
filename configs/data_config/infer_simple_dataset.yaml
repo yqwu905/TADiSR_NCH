@@ -1,0 +1,19 @@
+dataset:
+  target: data.inference_image_dataset.InferenceImageDataset
+  params:
+    input_path: /path/to/images
+    size: [2048, 1536]
+    recursive: true
+    interpolation: bicubic
+    square_policy: landscape
+    return_meta: true
+
+dataloader:
+  batch_size: 1
+  shuffle: false
+  num_workers: 4
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 1
+  timeout: 60
+  multiprocessing_context: spawn

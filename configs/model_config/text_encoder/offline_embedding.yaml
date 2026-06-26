@@ -1,0 +1,6 @@
+imports:
+  - params.trainable_vector_cfg: configs/model_config/text_encoder/nch_trainable_vector.yaml
+
+target: models.text_encoder.offline_embedding.EmbeddingDB
+params:
+  embedding_cache_path: embedding_pangu_1b_vl_for_mainsr_v3_3b_ti2i_dehalo.sqlite

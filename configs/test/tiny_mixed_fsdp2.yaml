@@ -1,0 +1,131 @@
+experiment:
+  output_dir: /tmp/fictional-fortnight-fsdp2-smoke
+
+runtime:
+  device: auto
+  mixed_precision: no
+  distributed:
+    strategy: fsdp2
+    fsdp:
+      default_non_fsdp_trainable: ddp
+      checkpoint:
+        format: full_rank0
+
+data:
+  train:
+    dataset:
+      target: test_assets.data.LinearRegressionDataset
+      params:
+        length: 16
+        input_dim: 4
+        output_dim: 2
+        seed: 17
+    dataloader:
+      batch_size: 4
+      shuffle: false
+      num_workers: 0
+      drop_last: false
+
+components:
+  fsdp_model:
+    target: test_assets.models.TinyRegressor
+    params:
+      input_dim: 4
+      hidden_dim: 8
+      output_dim: 2
+    train:
+      strategy: full
+    parallel:
+      strategy: fsdp2
+    fsdp:
+      wrap_modules:
+        - net.0
+    mode: train
+    save: full
+
+  adapter:
+    target: test_assets.models.TinyRegressor
+    params:
+      input_dim: 2
+      hidden_dim: 8
+      output_dim: 2
+    train:
+      strategy: full
+    parallel:
+      strategy: ddp
+    mode: train
+    save: full
+
+  frozen_teacher:
+    target: test_assets.models.TinyRegressor
+    params:
+      input_dim: 4
+      hidden_dim: 8
+      output_dim: 2
+    train:
+      strategy: frozen
+    parallel:
+      strategy: replicated
+    mode: eval
+    save: full
+
+optimizers:
+  main:
+    type: adam
+    lr: 0.01
+    params:
+      include:
+        - fsdp_model.trainable
+        - adapter.trainable
+
+losses:
+  mse:
+    target: test_assets.losses.RegressionMSELoss
+    weight: 1.0
+    inputs:
+      prediction: pred.value
+      target: batch.target
+
+train:
+  max_steps: 2
+  max_epochs: 2
+  log_every: 1
+
+checkpoint:
+  save_every_steps: 0
+  save_optimizer: true
+  save_scheduler: true
+
+logging:
+  reduce_metrics: true
+  tensorboard:
+    enabled: false
+
+train_program:
+  phases:
+    - name: mixed
+      trainable:
+        - fsdp_model
+        - adapter
+      frozen:
+        - frozen_teacher
+      zero_grad:
+        - main
+      ops:
+        fsdp_forward:
+          component: fsdp_model
+          inputs:
+            x: batch.input
+          outputs:
+            prediction: hidden.value
+        adapter_forward:
+          component: adapter
+          inputs:
+            x: hidden.value
+          outputs:
+            prediction: pred.value
+      losses:
+        - mse
+      backward: true
+      step:
+        - main

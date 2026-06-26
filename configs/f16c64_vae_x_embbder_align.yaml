@@ -1,0 +1,138 @@
+experiment:
+  name: f16c64_vae_x_embbder_align
+  output_dir: output/f16c64_vae_x_embbder_align
+
+imports:
+  data.train.dataset: configs/data_config/0612_deflare_1k_filtered.yaml
+  components.dit_old_x_embedder: configs/model_config/SR_nch_v3_ti2i_with_guidance_x_embedder_only.yaml
+  components.dit_new_x_embedder: configs/model_config/SR_nch_v3_ti2i_with_guidance_x_embedder_only_f16c64.yaml
+
+runtime:
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+  distributed:
+    strategy: ddp
+
+train:
+  max_steps: 100000
+  log_every: 10
+
+data:
+  train:
+    dataloader:
+      batch_size: 4
+      shuffle: true
+      num_workers: 4
+
+components:
+  f16c64_vae_encoder:
+    target: models.vae.npu.f16c64.VaeEncoder
+    params:
+      z_channels: 64
+      resolution: 256
+    checkpoint: /home/models/NCH/vae/npu/f16c64-mj-ft_1-ckpt-4000_encoder.pth
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+  f16c32_vae_encoder:
+    target: models.vae.rdp.f16c32.VaeEncoder
+    params:
+      use_checkpoint: True
+    checkpoint: /home/models/NCH/vae/rdpvae_f16c32/F16C32_DinoV3_NCH_RDP_v2_stage4_fp1024_ckpt_14000.pth
+    strict: False
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+  dit_old_x_embedder:
+    checkpoint: /home/models/NCH/NCHV3/NCH_V3_TI2I_Float.pth
+    strict: False
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+  dit_new_x_embedder:
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+optimizers:
+  generator_optim:
+    type: adamw
+    lr: 4.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - dit_new_x_embedder
+
+losses:
+  mse:
+    target: torch.nn.MSELoss
+    params:
+    inputs:
+      input: new_x_embedder.out
+      target: old_x_embedder.out
+    weight: 1.0
+
+train_program:
+  phases:
+    - name: generator
+      trainable:
+        - dit_new_x_embedder
+      zero_grad:
+        - generator_optim
+      backward: true
+      clip_grad:
+        max_norm: 10.0
+      step:
+        - generator_optim
+      ops:
+        f16c64_vae_encode:
+          component: f16c64_vae_encoder
+          inputs:
+            x: batch.gt
+          outputs:
+            latent: new_vae_encoder.latent
+        f16c32_vae_encode:
+          component: f16c32_vae_encoder
+          inputs:
+            x: batch.gt
+          outputs:
+            latent: old_vae_encoder.latent
+        old_x_embedder:
+          component: dit_old_x_embedder
+          inputs:
+            hidden_states: old_vae_encoder.latent
+          outputs:
+            out: old_x_embedder.out
+        new_x_embedder:
+          component: dit_new_x_embedder
+          inputs:
+            hidden_states: new_vae_encoder.latent
+          outputs:
+            out: new_x_embedder.out
+      losses:
+        - mse
+
+logging:
+  reduce_metrics: true
+  backends:
+    tensorboard:
+      enabled: true
+      log_dir: null
+    aim:
+      enabled: false
+      repo: null
+      experiment: null
+    wandb:
+      enabled: false
+      project: null
+      name: null
+
+profiling:
+  enabled: false
+  log_every: 1
+  synchronize: true
+  reduce: max

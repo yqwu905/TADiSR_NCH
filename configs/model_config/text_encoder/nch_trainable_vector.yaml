@@ -1,0 +1,20 @@
+target: models.text_encoder.nch.utils_nch.TrainableVector_multitask
+params:
+  bbox_fix_tokens: False
+  ctxt_fix_tokens: True
+  seg_fix_tokens: True
+  sr_fix_tokens: True
+  t2i_fix_tokens: True
+  sun_fix_tokens: True
+  facesr_fix_tokens: True
+  sr20Xbright_fix_tokens: True
+  sr20Xdark_fix_tokens: True
+  sr50X_fix_tokens: True
+  bokeh_fix_tokens: True
+  linedraw_fix_tokens: True
+  moonsr_fix_tokens: True
+  moonpainting_fix_tokens: True
+  refsr_fix_tokens: True
+  dehalo_fix_tokens: True
+  firework_fix_tokens: True
+  token_requires_grad: True
