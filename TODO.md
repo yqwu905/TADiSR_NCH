@@ -105,11 +105,15 @@
 - [x] `NCHTransformer2DModel` 加可选 `taca_cfg` 子模块 + forward `extract_a_tex` 收集 weights 产出 a_tex
 - [x] 扩展 `nch_mmdit_sr` op 支持 `extract_a_tex`，把 a_tex 写入 ctx（`pred.a_tex`）
 
-### 2.5 验证 ✅（CPU）/ ⬜（Colab GPU）
-- [x] `compileall` 全部通过（framework/test_assets/tests/models）
+### 2.5 验证 ✅
+- [x] `compileall` 全部通过（framework/test_assets/tests/models，CPU + Colab GPU）
 - [x] 36 个 unittest 全部通过（含 7 个新增 TACA 测试：投影头 shape/零初始化/梯度、手动 vs SDPA 数值一致性、weights 缓存、DiT extract a_tex、op 胶水）
 - [x] 不破坏 SR 基线（基线路径仍走 SDPA，返回 Transformer2DModelOutput）
-- [ ] Colab GPU smoke：TACA 提取 a_tex shape 正确（待跑）
+- [x] Colab GPU smoke（A100-40GB, torch 2.11.0+cu128）：37 层 DiT + TACA extract
+      @128×128 bf16，`a_tex [1,4096,1536]` 零初始化确认，峰值 21.8GB
+- [x] 已知限制：512×512 分辨率下手动 attention weights `[1,4,65792,65792]`
+      约 34GB → OOM。实际训练需在 ≤256 分辨率层开启 TACA，或后续优化为
+      chunked/行采样 attention（只实例化 text-token 行而非全矩阵）。
 
 ---
 
@@ -172,6 +176,9 @@
 - sparse processor 要求 ≥1024 分辨率（block_lenth=64 导致 topk 越界）
 - L4 24GB 无法跑完整 37 层 + 1024 分辨率（需 A100 或 gradient_checkpointing）
 - 无 sqlite 缓存时 EmbeddingDB 返回零张量（smoke 可用，实际训练需提供）
+- TACA 手动 attention 在 ≥512 分辨率时 OOM（weights 矩阵 ~34GB @512²）；
+  A100-40GB 下 128×128 bf16 可跑（峰值 21.8GB），256² 需减少 TACA 层数或开
+  gradient_checkpointing。后续可优化为 chunked/行采样 attention 降低显存。
 
 ---
 
