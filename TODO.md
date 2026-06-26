@@ -81,7 +81,7 @@
 
 ---
 
-## 阶段 2：TACA 文本感知（已实现，Colab GPU 验证待跑）
+## 阶段 2：TACA 文本感知（已实现，Colab GPU 验证完成）
 
 ### 2.1 Pangu token 位置分析 ✅
 - [x] 在 pangu 环境运行 `scripts/analyze_pangu_text_token.py`
@@ -89,31 +89,57 @@
 - [x] 256 序列结构：[1,1] 特殊 token + [0-6] 7 个 prompt token + [8] "▁text" + [9-254] padding + [255] eos
 - [x] TACA text_token_indices = [8]（配置中设置）
 
-### 2.2 Attention processor 改造 ✅
-- [x] 修改 `NCHAttnProcessor2_0`：用手动 softmax + matmul 替换 SDPA（开关式 `store_attn_weights`）
-- [x] 修改 `SparseAttnProcessor`：同样支持手动 attention 暴露 weights（`return_attn_weights`）
-- [x] 暴露 attention weights 供 TACA 提取（缓存到 `attn.last_attn_weights`）
-- [x] 验证手动 attention 与 SDPA 数值一致性（`tests/test_taca.py`，fp32 atol=1e-4）
+### 2.2 Attention processor 改造 ✅（chunked logsumexp 重构）
+- [x] `NCHAttnProcessor2_0`：新增 `taca_config` 旁路模式（chunked logsumexp，image→text 方向）
+- [x] 主路径始终走 fused SDPA，旁路只算 text attention slice，不实例化全矩阵
+- [x] 旁路支持 query chunking + gradient checkpointing（`query_chunk_size`, `use_checkpoint`）
+- [x] `SparseAttnProcessor`：保留旧 `store_attn_weights` 全矩阵路径（后续再适配）
+- [x] 验证 chunked logsumexp 与全矩阵数值一致性（fp32 max_diff=2.56e-09，atol=1e-5 PASS）
+- [x] 验证主路径 SDPA 输出在 extract 开关下不变（atol=1e-6）
 
 ### 2.3 TACA 投影头 ✅
-- [x] 新增 `models/dit/nch/ldm/taca.py` — `TACAProjection` 模块
-- [x] 从 attention weights 提取文本 token 对应行（image 列）
-- [x] 拼接多层的 a_tex → 线性投影 → `pred.a_tex`
+- [x] `models/dit/nch/ldm/taca.py` — `TACAProjection` 接受预提取 slice `[B,H,S_img,n_text]`
+- [x] 拼接多层 slice → 线性投影 → `pred.a_tex` `[B,S_img,out_dim]`
 - [x] 零初始化，保证不扰动预训练路径（weight/bias 全零，初始 a_tex=0）
 
 ### 2.4 TACA 提取集成 ✅
-- [x] `NCHTransformer2DModel` 加可选 `taca_cfg` 子模块 + forward `extract_a_tex` 收集 weights 产出 a_tex
+- [x] `NCHTransformer2DModel` forward：设置 `taca_config` → 收集 `taca_slice` → 投影 a_tex
 - [x] 扩展 `nch_mmdit_sr` op 支持 `extract_a_tex`，把 a_tex 写入 ctx（`pred.a_tex`）
 
 ### 2.5 验证 ✅
 - [x] `compileall` 全部通过（framework/test_assets/tests/models，CPU + Colab GPU）
-- [x] 36 个 unittest 全部通过（含 7 个新增 TACA 测试：投影头 shape/零初始化/梯度、手动 vs SDPA 数值一致性、weights 缓存、DiT extract a_tex、op 胶水）
+- [x] 39 个 unittest 全部通过（含 9 个 TACA 测试：投影头 shape/零初始化/梯度、
+      legacy 手动 vs SDPA、chunked vs 全矩阵数值一致性、主路径不变、slice shape/概率范围、
+      DiT extract a_tex、op 胶水）
 - [x] 不破坏 SR 基线（基线路径仍走 SDPA，返回 Transformer2DModelOutput）
-- [x] Colab GPU smoke（A100-40GB, torch 2.11.0+cu128）：37 层 DiT + TACA extract
-      @128×128 bf16，`a_tex [1,4096,1536]` 零初始化确认，峰值 21.8GB
-- [x] 已知限制：512×512 分辨率下手动 attention weights `[1,4,65792,65792]`
-      约 34GB → OOM。实际训练需在 ≤256 分辨率层开启 TACA，或后续优化为
-      chunked/行采样 attention（只实例化 text-token 行而非全矩阵）。
+- [x] Colab GPU 数值一致性（A100-40GB, fp32）：chunked logsumexp vs 全矩阵 max_diff=2.56e-09
+
+### 2.6 Colab GPU 显存 benchmark ✅（A100-40GB, bf16, no_grad）
+
+单层 attention 显存对比（旧全矩阵 vs 新 chunked logsumexp）：
+
+| 分辨率 | S_img | 旧方法(MB) | 新方法(MB) | 节省 |
+|---|---|---|---|---|
+| 128 | 4096 | 345.5 | 198.5 | 2x |
+| 256 | 16384 | 4585.9 | 752.2 | 6x |
+| 384 | 36864 | 22390.8 | 1675.2 | 13x |
+| 512 | 65536 | OOM | 2967.2 | ∞ |
+| 1024 | 262144 | — | 11827.2 | — |
+
+37 层 DiT + TACA extract 端到端显存扫描（3 层 TACA, chunk=1024）：
+
+| 分辨率 | S_img | 峰值(GB) | Fwd+TACA(GB) |
+|---|---|---|---|
+| 128 | 4096 | 15.13 | 0.29 |
+| 256 | 16384 | 15.97 | 1.13 |
+| 384 | 36864 | 17.46 | 2.62 |
+| 512 | 65536 | 19.63 | 4.78 |
+| 640 | 102400 | 22.28 | 7.43 |
+| 768 | 147456 | 25.39 | 10.54 |
+
+- [x] 旧方法 512×512 OOM（weights 矩阵 ~34GB）；新方法 768×768 仅 25.39GB
+- [x] A100-40GB 推理上限：768×768（25.39GB，还有 ~15GB 余量）
+- [x] 训练（带 backward）预计 512×512 可行（推理 19.63GB + 梯度 ~10-15GB）
 
 ---
 
