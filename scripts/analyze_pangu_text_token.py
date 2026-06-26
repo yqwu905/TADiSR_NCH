@@ -1,13 +1,7 @@
 """
 Analyze the token position of keyword "text" in the pangu 256-token sequence.
 
-TADiSR's TACA needs to locate the "text" keyword token in the text encoder
-output sequence to extract the corresponding attention. With offline
-EmbeddingDB, the 256-length encoder_hidden_states are precomputed, so we run
-this script ONCE with the real pangu model to find the fixed index, then
-hardcode it into the training config.
-
-Usage (run in an environment with pangu model + tokenizer available):
+Usage (run with pangu model + tokenizer available):
 
     python scripts/analyze_pangu_text_token.py \
         --vlm_model_path /path/to/vlm_model \
@@ -17,13 +11,7 @@ Usage (run in an environment with pangu model + tokenizer available):
         --prompt "A high-quality photo with clear text" \
         --task_tokens dehalo
 
-Output prints the token index(es) of "text" in the 256-sequence, which should
-be filled into configs/tadisr_*.yaml as `taca.text_token_indices`.
-
-NOTE: This script depends on the pangu inference stack
-(models.pangu_vl_1B_v1.inference_und.initialize_model) which is NOT part of
-this repo. Adjust the import path and initialize_model signature to match
-your local pangu installation.
+Output prints the keyword token index(es) in the 256-length sequence.
 """
 from __future__ import annotations
 
@@ -36,55 +24,30 @@ def main():
     parser.add_argument("--vlm_model_path", type=str, required=True)
     parser.add_argument("--vlm_llm_path", type=str, required=True)
     parser.add_argument("--vlm_vit_path", type=str, required=True)
-    parser.add_argument("--vocab_file", type=str, required=True,
-                        help="SentencePiece vocab file for PanguTokenizer")
+    parser.add_argument("--vocab_file", type=str, required=True)
     parser.add_argument("--prompt", type=str,
                         default="A high-quality photo with clear text")
-    parser.add_argument("--task_tokens", type=str, default=None,
-                        help="task key like 'dehalo' to prepend task token prefix")
-    parser.add_argument("--keyword", type=str, default="text",
-                        help="keyword to locate in the token sequence")
+    parser.add_argument("--task_tokens", type=str, default=None)
+    parser.add_argument("--keyword", type=str, default="text")
     args = parser.parse_args()
 
-    # --- Lazy imports: only needed when running this script ---
     import torch
 
-    # Adjust this import to match your local pangu package layout.
-    try:
-        from models.pangu_vl_1B_v1.inference_und import initialize_model
-    except ImportError as e:
-        print(
-            f"[ERROR] cannot import initialize_model: {e}\n"
-            "Adjust the import path in this script to match your pangu layout.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # Adjust these imports to your pangu installation
+    from models.pangu_vl_1B_v1.inference_und import initialize_model
+    from models.tokenizer.pangu_tokenizer import PanguTokenizer
 
-    # --- Build tokenizer (PanguTokenizer) ---
-    # The full PanguTokenizer class was provided separately; place it in
-    # models/tokenizer/pangu_tokenizer.py or adjust the import below.
-    try:
-        from models.tokenizer.pangu_tokenizer import PanguTokenizer
-    except ImportError:
-        print(
-            "[ERROR] cannot import PanguTokenizer. "
-            "Place the tokenizer class in models/tokenizer/pangu_tokenizer.py "
-            "with proper imports (PreTrainedTokenizer, spm, VOCAB_FILES_NAMES, etc.).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
+    # --- Tokenizer ---
     tokenizer = PanguTokenizer(vocab_file=args.vocab_file)
 
-    # --- Build task token prefix (mirror EmbeddingDB/TrainableVector logic) ---
+    # --- Task token prefix (mirrors EmbeddingDB logic) ---
     task_prefix = ""
     if args.task_tokens:
         from types import SimpleNamespace
         from framework.instantiate import instantiate
         from omegaconf import OmegaConf
 
-        tv_cfg_path = "configs/model_config/text_encoder/nch_trainable_vector.yaml"
-        tv_cfg = OmegaConf.load(tv_cfg_path)
+        tv_cfg = OmegaConf.load("configs/model_config/text_encoder/nch_trainable_vector.yaml")
         tv_cfg.params.vlm_text_encoder = SimpleNamespace(tokenizer=None, model=None)
         tv = instantiate(tv_cfg)
         if args.task_tokens in tv.task_tokens:
@@ -94,86 +57,107 @@ def main():
     full_prompt = task_prefix + args.prompt
     print(f"[info] full prompt: {full_prompt!r}")
 
-    # --- Tokenize the raw prompt (without pangu wrapping) for reference ---
+    # --- Raw tokenization (for reference) ---
     raw_ids = tokenizer.encode(full_prompt, add_special_tokens=False)
-    raw_tokens = [tokenizer.convert_ids_to_ids(i) for i in raw_ids]
     raw_tokens = tokenizer.convert_ids_to_tokens(raw_ids)
     print(f"[info] raw tokenization ({len(raw_tokens)} tokens):")
+    keyword_raw_indices = []
     for i, tok in enumerate(raw_tokens):
         marker = "  <== KEYWORD" if args.keyword.lower() in tok.lower() else ""
-        print(f"  [{i:3d}] {tok!r}{marker}")
+        print(f"  [{i:3d}] id={raw_ids[i]} {tok!r}{marker}")
+        if args.keyword.lower() in tok.lower():
+            keyword_raw_indices.append(i)
+    print(f"[info] '{args.keyword}' raw token indices: {keyword_raw_indices}")
 
-    # --- Initialize pangu model and run prepare_prompts ---
-    print("[info] initializing pangu model (this may take a while)...")
+    # --- Initialize pangu model ---
+    print("[info] initializing pangu model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vlm_text_encoder = initialize_model(
+    inferencer = initialize_model(
         model_path=args.vlm_model_path,
         llm_path=args.vlm_llm_path,
         vit_path=args.vlm_vit_path,
         device=device.index if device.type == "cuda" else 0,
     )
 
-    # new_token_ids: adjust if your pangu version needs different ids.
-    new_token_ids = {
-        "boi_token_id": vlm_text_encoder.boi_token_id,
-        "eoi_token_id": vlm_text_encoder.eoi_token_id,
-        "eos_token_id": vlm_text_encoder.eos_token_id,
+    # new_token_ids lives on the model, not the inferencer
+    new_token_ids = inferencer.new_token_ids
+
+    # --- Run prepare_prompts to get packed_text_ids ---
+    gen_context = {
+        'kv_lens': [0],
+        'ropes': [0],
+        'past_key_values': inferencer.init_gen_context()['past_key_values'],
     }
 
-    gen_input, kv_lens, ropes = vlm_text_encoder.prepare_prompts(
-        curr_kvlens=[0],
-        curr_rope=[0],
+    generation_input, kv_lens, ropes = inferencer.model.prepare_prompts(
+        curr_kvlens=gen_context['kv_lens'],
+        curr_rope=gen_context['ropes'],
         prompts=[full_prompt],
         tokenizer=tokenizer,
         new_token_ids=new_token_ids,
     )
 
-    # The 256-length sequence is built by prepare_prompts. We need to recover
-    # which positions correspond to the prompt tokens. Two strategies:
-    #
-    # Strategy 1 (preferred): inspect packed_text_ids if present.
-    packed_text_ids = gen_input.get("packed_text_ids")
+    print(f"[info] generation_input keys: {list(generation_input.keys())}")
+
+    # --- Strategy 1: inspect packed_text_ids ---
+    packed_text_ids = generation_input.get("packed_text_ids")
     if packed_text_ids is not None:
         ids_seq = packed_text_ids.squeeze().tolist()
         print(f"[info] packed_text_ids length: {len(ids_seq)}")
+        print(f"[info] first 50 ids: {ids_seq[:50]}")
+        print(f"[info] last 10 ids: {ids_seq[-10:]}")
+
         keyword_token_ids = set()
-        for t in raw_tokens:
-            if args.keyword.lower() in t.lower():
-                tid = tokenizer.convert_tokens_to_ids(t)
-                keyword_token_ids.add(tid)
-        print(f"[info] keyword token ids: {keyword_token_ids}")
+        for idx in keyword_raw_indices:
+            keyword_token_ids.add(raw_ids[idx])
+        print(f"[info] keyword token ids: {keyword_token_ids} (from raw indices {keyword_raw_indices})")
+
         matches = [i for i, tid in enumerate(ids_seq) if tid in keyword_token_ids]
-        print(f"\n>>> RESULT: keyword '{args.keyword}' at positions: {matches}")
-        print(f"    (in the {len(ids_seq)}-length packed_text_ids sequence)")
-        for m in matches:
-            print(f"    [{m:3d}] id={ids_seq[m]} token={tokenizer.convert_ids_to_tokens(ids_seq[m])!r}")
-        return matches
+        if matches:
+            print(f"\n>>> RESULT: keyword '{args.keyword}' at packed positions: {matches}")
+            for m in matches:
+                tok = tokenizer.convert_ids_to_tokens(ids_seq[m])
+                print(f"    [{m:3d}] id={ids_seq[m]} token={tok!r}")
+            print("\n[usage] Set these indices as taca.text_token_indices in the training config.")
+        else:
+            # Try partial matching: check if any keyword token is a substring of other tokens
+            print(f"[warn] no exact match; trying partial substring match...")
+            keyword_str = args.keyword.lower()
+            partial_matches = []
+            for i, tid in enumerate(ids_seq[:100]):
+                try:
+                    tok = tokenizer.convert_ids_to_tokens(tid)
+                    if keyword_str in tok.lower():
+                        partial_matches.append((i, tid, tok))
+                except Exception:
+                    pass
+            if partial_matches:
+                print(f"\n>>> RESULT (partial): keyword '{args.keyword}' at positions: {[m[0] for m in partial_matches]}")
+                for m in partial_matches:
+                    print(f"    [{m[0]:3d}] id={m[1]} token={m[2]!r}")
+            else:
+                print("\n[info] No 'text' token found in packed_text_ids.")
+                print("    This is expected if pangu uses a subword tokenizer that splits 'text'")
+                print("    differently. Check raw tokenization output above for the actual keyword")
+                print(f"    token id ({raw_ids[keyword_raw_indices[0]] if keyword_raw_indices else 'N/A'}).")
+                print("    You can manually search for this ID in the packed sequence.")
+    else:
+        # Fallback: run encode_prompts and use prefix-based position estimation
+        print("[warn] packed_text_ids not found. Running encode_prompts...")
+        from copy import deepcopy
+        ctx = deepcopy(gen_context)
+        prompt_embeds = inferencer.encode_prompts([full_prompt])
+        print(f"[info] encode_prompts output shape: {prompt_embeds.shape}")
 
-    # Strategy 2: run forward and inspect output shape / packed_query.
-    print("[warn] packed_text_ids not found in prepare_prompts output, "
-          "falling back to forward pass.")
-    try:
-        from models.pangu_vl_1B_v1.cache import NaiveCache
-    except ImportError:
-        NaiveCache = None
-        print("[warn] NaiveCache import failed; provide it if forward needs it.")
-
-    if NaiveCache is None:
-        print("[ERROR] cannot run forward without NaiveCache. "
-              "Inspect gen_input keys manually:", list(gen_input.keys()))
-        sys.exit(1)
-
-    past_key_values = NaiveCache(vlm_text_encoder.config.llm_config.num_hidden_layers)
-    output = vlm_text_encoder.forward_cache_update_text(past_key_values, **gen_input)
-    packed_query = output["packed_query_sequence"]
-    print(f"[info] packed_query_sequence shape: {packed_query.shape}")
-    seq_len = packed_query.shape[1] if packed_query.dim() == 3 else packed_query.shape[0]
-    print(f"[info] sequence length: {seq_len}")
-    print("\n[NOTE] The 256-length encoder_hidden_states used by EmbeddingDB is the")
-    print("       reshaped packed_query_sequence ([B, 256, 1536]). To find the keyword")
-    print("       position, compare packed_text_ids (strategy 1) which is the reliable way.")
-    print("       If prepare_prompts does not expose token ids, you must inspect the")
-    print("       prepare_prompts source to map prompt tokens to sequence positions.")
+        # Estimate position: task_prefix tokens + system prompt + special tokens
+        task_len = len(tokenizer.encode(task_prefix, add_special_tokens=False)) if task_prefix else 0
+        prompt_len = len(raw_ids)
+        estimated_offset = 0  # need to know the system prompt length
+        print(f"\n[info] raw prompt length: {prompt_len} tokens (incl. task_prefix: {task_len})")
+        print(f"    The 256 sequence includes system prompt + special tokens before the prompt.")
+        print(f"    The keyword's position = offset + {keyword_raw_indices}")
+        print(f"\n    To find the exact offset, inspect prepare_prompts source or")
+        print(f"    re-run with packed_text_ids exposed.")
 
 
 if __name__ == "__main__":
