@@ -83,10 +83,11 @@
 
 ## 阶段 2：TACA 文本感知（待实现）
 
-### 2.1 Pangu token 位置分析 ⬜
-- [ ] 在 pangu 环境运行 `scripts/analyze_pangu_text_token.py`
-- [ ] 获得 "text" 在 256 序列的 index
-- [ ] 硬编码到训练配置
+### 2.1 Pangu token 位置分析 ✅
+- [x] 在 pangu 环境运行 `scripts/analyze_pangu_text_token.py`
+- [x] 结果：prompt "A high-quality photo with clear text" 在 256 序列中 index=8
+- [x] 256 序列结构：[1,1] 特殊 token + [0-6] 7 个 prompt token + [8] "▁text" + [9-254] padding + [255] eos
+- [x] TACA text_token_indices = [8]（配置中设置）
 
 ### 2.2 Attention processor 改造 ⬜
 - [ ] 修改 `NCHAttnProcessor2_0`：用手动 softmax + matmul 替换 SDPA
