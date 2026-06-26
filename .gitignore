@@ -14,5 +14,10 @@ output
 # Codemap tool local state
 .slim
 
+# EmbeddingDB cache (generated at runtime, do not commit)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
 # Reference framework source (migrated into root)
 fictional-fortnight/

@@ -214,3 +214,147 @@ class NCHLDMV3TwoStepOp:
             return model_result[int(self.model_output_index)]
 
         return model_result
+
+
+@register_op("nch_mmdit_sr")
+class NCHMMDiTSROp:
+    """
+    NCH MMDiT super-resolution denoising op.
+
+    Adapts the new NCHTransformer2DModel forward signature
+    (hidden_states, encoder_hidden_states, timestep, enable_skip_level) ->
+    Transformer2DModelOutput(sample) to the framework op protocol.
+
+    Input construction (per user spec):
+        The DiT x_embedder expects in_channels=1024. This is produced by
+        concatenating [x_start, mask, mask_image_latents] along channel dim,
+        where x_start is the noisy/identity latent (64ch), mask is 2x the
+        latent channels (128ch), and mask_image_latents is the LQ latent
+        (64ch). 64*(1+2+1)=256, then a 2x2 patchify inside the DiT yields
+        256*4=1024 channels matching x_embedder.
+
+        - input_type "lq": x_start = lq latent (LQ-as-start, no noise)
+        - input_type "noise": x_start = randn_like(lq latent)
+        - mask_repeat controls the mask channel multiplier (default 2)
+
+    Flow-matching single-step denoising:
+        timestep t in [0,1]; the op runs the DiT once at the configured
+        timestep and writes the model output (Transformer2DModelOutput.sample)
+        back to context. The model output is a velocity (v) prediction; the
+        denoised latent is x0 = x_start - (1-t)*v for LQ-as-start, or
+        x0 = x_start + (1-t)*v depending on convention. We expose the raw
+        model output and a `denoise` flag to control post-processing.
+
+    Device handling: encoder_hidden_states from EmbeddingDB may be on CPU;
+    this op moves it to the latent's device before calling the model.
+    """
+
+    _INPUT_TYPES = {"noise", "lq"}
+
+    def __init__(self, cfg):
+        self.cfg = dict(_plain(cfg))
+        self.component_name = self.cfg.get("component") or self.cfg.get("dit")
+        if not self.component_name:
+            raise ValueError("nch_mmdit_sr requires 'component' or 'dit'")
+
+        self.input_type = str(self.cfg.get("input_type", "lq"))
+        if self.input_type not in self._INPUT_TYPES:
+            raise ValueError(
+                f"unsupported input_type for nch_mmdit_sr: {self.input_type!r}; "
+                f"must be one of {self._INPUT_TYPES}"
+            )
+
+        self.timestep = float(self.cfg.get("timestep", 1.0))
+        self.mask_repeat = int(self.cfg.get("mask_repeat", 2))
+        if self.mask_repeat < 1:
+            raise ValueError("nch_mmdit_sr mask_repeat must be >= 1")
+
+        self.concat_dim = int(self.cfg.get("concat_dim", 1))
+        self.enable_skip_level = self.cfg.get("enable_skip_level")
+        self.denoise = bool(self.cfg.get("denoise", True))
+
+    def __call__(self, ctx, components):
+        inputs = dict(self.cfg.get("inputs", {}) or {})
+        if "latent" not in inputs:
+            raise KeyError("nch_mmdit_sr inputs must include 'latent' (lq latent)")
+        if "encoder_hidden_states" not in inputs:
+            raise KeyError(
+                "nch_mmdit_sr inputs must include 'encoder_hidden_states'"
+            )
+
+        latent = resolve_input(inputs["latent"], ctx)
+        encoder_hidden_states = resolve_input(inputs["encoder_hidden_states"], ctx)
+
+        if not torch.is_tensor(latent):
+            raise TypeError(
+                f"nch_mmdit_sr latent must resolve to a tensor, got {type(latent)}"
+            )
+        if latent.ndim < 4:
+            raise ValueError(
+                "nch_mmdit_sr latent must have batch and channel dims (NCHW)"
+            )
+
+        if torch.is_tensor(encoder_hidden_states):
+            encoder_hidden_states = encoder_hidden_states.to(
+                device=latent.device, dtype=latent.dtype
+            )
+
+        if self.input_type == "noise":
+            x_start = torch.randn_like(latent)
+        else:
+            x_start = latent
+
+        mask = torch.ones_like(latent)
+        repeat_shape = [1] * latent.ndim
+        repeat_shape[self.concat_dim] = self.mask_repeat
+        mask = torch.tile(mask, tuple(repeat_shape))
+        mask_image_latents = latent
+
+        model_input = torch.cat(
+            [x_start, mask, mask_image_latents],
+            dim=self.concat_dim,
+        )
+
+        bs = latent.shape[0]
+        timestep = torch.full(
+            (bs,),
+            self.timestep,
+            device=latent.device,
+            dtype=latent.dtype,
+        )
+
+        model = components[self.component_name]
+        model_kwargs = {
+            "hidden_states": model_input,
+            "encoder_hidden_states": encoder_hidden_states,
+            "timestep": timestep,
+        }
+        if self.enable_skip_level is not None:
+            model_kwargs["enable_skip_level"] = self.enable_skip_level
+
+        model_result = model(**model_kwargs)
+
+        sample = self._extract_sample(model_result)
+
+        if self.denoise:
+            dt = 1.0 - self.timestep
+            dt_view = [1] * sample.ndim
+            dt_view[0] = bs
+            sample = x_start - dt * sample
+
+        result = {"latent_denoised": sample}
+        outputs = self.cfg.get("outputs")
+        if outputs is not None:
+            _write_outputs(ctx, result, outputs)
+        else:
+            ctx.set(self.cfg.get("output", "pred.latent_denoised"), sample)
+
+    @staticmethod
+    def _extract_sample(model_result):
+        if hasattr(model_result, "sample"):
+            return model_result.sample
+        if isinstance(model_result, dict):
+            return model_result["sample"]
+        if isinstance(model_result, (tuple, list)):
+            return model_result[0]
+        return model_result

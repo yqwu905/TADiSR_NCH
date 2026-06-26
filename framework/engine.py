@@ -81,6 +81,10 @@ def build_dataloader(data_cfg, dist_state=None):
     dataset = instantiate(data_cfg["dataset"])
     dl_cfg = dict(data_cfg.get("dataloader", {}) or {})
 
+    collate_cfg = dl_cfg.pop("collate_fn", None)
+    if collate_cfg is not None:
+        dl_cfg["collate_fn"] = instantiate(collate_cfg)
+
     num_workers = int(dl_cfg.get("num_workers", 0))
 
     if num_workers > 0:
