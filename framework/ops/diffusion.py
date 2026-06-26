@@ -272,6 +272,7 @@ class NCHMMDiTSROp:
         self.concat_dim = int(self.cfg.get("concat_dim", 1))
         self.enable_skip_level = self.cfg.get("enable_skip_level")
         self.denoise = bool(self.cfg.get("denoise", True))
+        self.extract_a_tex = bool(self.cfg.get("extract_a_tex", False))
 
     def __call__(self, ctx, components):
         inputs = dict(self.cfg.get("inputs", {}) or {})
@@ -331,10 +332,16 @@ class NCHMMDiTSROp:
         }
         if self.enable_skip_level is not None:
             model_kwargs["enable_skip_level"] = self.enable_skip_level
+        if self.extract_a_tex:
+            model_kwargs["extract_a_tex"] = True
 
         model_result = model(**model_kwargs)
 
         sample = self._extract_sample(model_result)
+
+        a_tex = None
+        if self.extract_a_tex and isinstance(model_result, dict):
+            a_tex = model_result.get("a_tex")
 
         if self.denoise:
             dt = 1.0 - self.timestep
@@ -343,11 +350,15 @@ class NCHMMDiTSROp:
             sample = x_start - dt * sample
 
         result = {"latent_denoised": sample}
+        if a_tex is not None:
+            result["a_tex"] = a_tex
         outputs = self.cfg.get("outputs")
         if outputs is not None:
             _write_outputs(ctx, result, outputs)
         else:
             ctx.set(self.cfg.get("output", "pred.latent_denoised"), sample)
+            if a_tex is not None:
+                ctx.set(self.cfg.get("a_tex_output", "pred.a_tex"), a_tex)
 
     @staticmethod
     def _extract_sample(model_result):

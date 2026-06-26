@@ -226,6 +226,7 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         block_lenth: int = 64,
         topK: list = [0.8333] * 37,
         adaln_dim=256,
+        taca_cfg: dict = None,
     ):
         super().__init__()
 
@@ -306,6 +307,25 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         self.proj_out_30 = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
         
         self.gradient_checkpointing = False
+
+        # TACA: optional text-aware cross-attention projection head.
+        # When enabled, the DiT exposes attention weights from the configured
+        # blocks and projects the text-token rows into ``a_tex`` via a
+        # zero-initialized linear (see forward ``extract_a_tex``).
+        taca_cfg = taca_cfg or {}
+        self.taca_layers = list(taca_cfg.get("taca_layers", []))
+        self.taca_text_token_indices = list(taca_cfg.get("text_token_indices", []))
+        self.taca = None
+        if taca_cfg.get("enabled", False) and self.taca_layers and self.taca_text_token_indices:
+            from .taca import TACAProjection
+
+            out_dim = int(taca_cfg.get("out_dim", self.inner_dim))
+            self.taca = TACAProjection(
+                num_layers=len(self.taca_layers),
+                num_heads=num_attention_heads,
+                num_text_tokens=len(self.taca_text_token_indices),
+                out_dim=out_dim,
+            )
 
     @property
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
@@ -454,6 +474,7 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             controlnet_blocks_repeat: bool = False,
             return_rep: bool = False,
             enable_skip_level: str = "100",
+            extract_a_tex: bool = False,
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
         """
         The [`NCHTransformer2DModel`] forward method.
@@ -550,6 +571,19 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             torch.save(encoder_hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_encoder_hidden_state_in.pt")
             torch.save(hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_hidden_state_in.pt")
         
+        # TACA: enable attention-weight harvesting on selected blocks.
+        extracting = extract_a_tex and self.taca is not None
+        for block in self.transformer_blocks:
+            block.attn.store_attn_weights = False
+            block.attn.last_attn_weights = None
+        taca_layers_set = set()
+        if extracting:
+            taca_layers_set = set(self.taca_layers)
+            for li in self.taca_layers:
+                if li < len(self.transformer_blocks):
+                    self.transformer_blocks[li].attn.store_attn_weights = True
+        collected_weights = [] if extracting else None
+
         features = []
         for index_block, block in enumerate(self.transformer_blocks):
             if index_block not in self.layers_to_retained[enable_skip_level]['transformer_blocks']:
@@ -591,6 +625,12 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
 
+            # TACA: harvest attention weights from selected blocks.
+            if collected_weights is not None and index_block in taca_layers_set:
+                attn_w = block.attn.last_attn_weights
+                if attn_w is not None:
+                    collected_weights.append(attn_w)
+
             # controlnet residual
             if controlnet_block_samples is not None:
                 interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
@@ -605,6 +645,17 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             if index_block in [9, 18]:
                 ori_hidden_states = hidden_states.reshape(bs*new_H, new_W, block_lenth_2D, -1).transpose(1, 2).reshape(bs, new_img_len, -1)
                 features.append(ori_hidden_states)
+
+        # TACA: project harvested attention weights into a_tex.
+        a_tex = None
+        if collected_weights is not None and self.taca is not None:
+            if len(collected_weights) == len(self.taca_layers):
+                text_seq_len = encoder_hidden_states.shape[1]
+                a_tex = self.taca(
+                    collected_weights,
+                    self.taca_text_token_indices,
+                    text_seq_len,
+                )
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
@@ -647,6 +698,9 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
+
+        if a_tex is not None:
+            return {"sample": output, "a_tex": a_tex}
 
         if not return_dict:
             return (output,)

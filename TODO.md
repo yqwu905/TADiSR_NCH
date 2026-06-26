@@ -81,7 +81,7 @@
 
 ---
 
-## 阶段 2：TACA 文本感知（待实现）
+## 阶段 2：TACA 文本感知（已实现，Colab GPU 验证待跑）
 
 ### 2.1 Pangu token 位置分析 ✅
 - [x] 在 pangu 环境运行 `scripts/analyze_pangu_text_token.py`
@@ -89,25 +89,27 @@
 - [x] 256 序列结构：[1,1] 特殊 token + [0-6] 7 个 prompt token + [8] "▁text" + [9-254] padding + [255] eos
 - [x] TACA text_token_indices = [8]（配置中设置）
 
-### 2.2 Attention processor 改造 ⬜
-- [ ] 修改 `NCHAttnProcessor2_0`：用手动 softmax + matmul 替换 SDPA
-- [ ] 修改 `SparseAttnProcessor`：同样替换 SDPA
-- [ ] 暴露 attention weights 供 TACA 提取
-- [ ] 验证手动 attention 与 SDPA 数值一致性
+### 2.2 Attention processor 改造 ✅
+- [x] 修改 `NCHAttnProcessor2_0`：用手动 softmax + matmul 替换 SDPA（开关式 `store_attn_weights`）
+- [x] 修改 `SparseAttnProcessor`：同样支持手动 attention 暴露 weights（`return_attn_weights`）
+- [x] 暴露 attention weights 供 TACA 提取（缓存到 `attn.last_attn_weights`）
+- [x] 验证手动 attention 与 SDPA 数值一致性（`tests/test_taca.py`，fp32 atol=1e-4）
 
-### 2.3 TACA 投影头 ⬜
-- [ ] 新增 `models/dit/nch/ldm/taca.py` — TACA 模块
-- [ ] 从 attention weights 提取文本 token 对应行
-- [ ] 拼接多层的 a_tex → 线性投影 → `pred.a_tex`
-- [ ] 零初始化，保证不扰动预训练路径
+### 2.3 TACA 投影头 ✅
+- [x] 新增 `models/dit/nch/ldm/taca.py` — `TACAProjection` 模块
+- [x] 从 attention weights 提取文本 token 对应行（image 列）
+- [x] 拼接多层的 a_tex → 线性投影 → `pred.a_tex`
+- [x] 零初始化，保证不扰动预训练路径（weight/bias 全零，初始 a_tex=0）
 
-### 2.4 TACA 提取 op ⬜
-- [ ] 新增 op 从 DiT 中间层提取 a_tex 写入 ctx
-- [ ] 或通过 hook 机制注册到 transformer blocks
+### 2.4 TACA 提取集成 ✅
+- [x] `NCHTransformer2DModel` 加可选 `taca_cfg` 子模块 + forward `extract_a_tex` 收集 weights 产出 a_tex
+- [x] 扩展 `nch_mmdit_sr` op 支持 `extract_a_tex`，把 a_tex 写入 ctx（`pred.a_tex`）
 
-### 2.5 验证 ⬜
-- [ ] Colab GPU smoke：TACA 提取 a_tex shape 正确
-- [ ] 不破坏 SR 基线 loss
+### 2.5 验证 ✅（CPU）/ ⬜（Colab GPU）
+- [x] `compileall` 全部通过（framework/test_assets/tests/models）
+- [x] 36 个 unittest 全部通过（含 7 个新增 TACA 测试：投影头 shape/零初始化/梯度、手动 vs SDPA 数值一致性、weights 缓存、DiT extract a_tex、op 胶水）
+- [x] 不破坏 SR 基线（基线路径仍走 SDPA，返回 Transformer2DModelOutput）
+- [ ] Colab GPU smoke：TACA 提取 a_tex shape 正确（待跑）
 
 ---
 
@@ -177,7 +179,7 @@
 
 | 阻塞项 | 状态 | 说明 |
 |---|---|---|
-| Pangu 分析环境 | ⬜ 待用户跑脚本 | 阻塞阶段 2 TACA token 位置 |
+| Pangu 分析环境 | ✅ 已完成 | index=8，阶段 2 TACA token 位置已确定 |
 | SQLite 缓存文件 | ⬜ 待用户提供路径 | 阻塞实际训练（smoke 用零张量可跑） |
 | FTSR 数据集 | ⬜ 待用户本地接入 | 阻塞实际训练（smoke 用随机数据可跑） |
 | DiT/VAE checkpoint | 可选 | 实际训练时填路径，smoke 用随机初始化 |

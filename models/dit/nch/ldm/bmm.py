@@ -8,6 +8,24 @@ if is_torch_npu_available():
     import torch_npu
 
 
+def _manual_masked_attention(query, key, value, masked_mask=None, scale=None):
+    """Manual scaled-dot-product attention returning (output, attn_weights).
+
+    ``masked_mask`` is a bool tensor where True marks positions to mask out
+    (set to -inf before softmax), matching the convention used by the sparse
+    processors (the ``mask`` tensor before ``.logical_not()`` is applied for
+    SDPA). Used to expose attention weights for TACA extraction.
+    """
+    if scale is None:
+        scale = 1.0 / math.sqrt(query.size(-1))
+    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scale
+    if masked_mask is not None:
+        attn_weights = attn_weights.masked_fill(masked_mask, float("-inf"))
+    attn_weights = torch.softmax(attn_weights, dim=-1).to(query.dtype)
+    out = torch.matmul(attn_weights, value)
+    return out, attn_weights
+
+
 class Bmm(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -85,7 +103,7 @@ class SparseProcessAttnAigc(ScaledDotProductAttnAigc):
         )
 
 
-    def forward(self, query, key, value, img_len, batch_size, sparse_ratio): #### qkv after retory
+    def forward(self, query, key, value, img_len, batch_size, sparse_ratio, return_attn_weights=False): #### qkv after retory
         # add by yulei.
         ''' args '''
         block_lenth = 64  # num_block = 4096 // 32 = 128 (1024 * 1024)  256 // 32 = 8 (256, 256)
@@ -125,6 +143,11 @@ class SparseProcessAttnAigc(ScaledDotProductAttnAigc):
         # print(f"final mask: {mask.shape}")
 
         # add by dkp.
+        if return_attn_weights:
+            ori_hidden_states, attn_weights = _manual_masked_attention(
+                query, key, value, masked_mask=mask
+            )
+            return ori_hidden_states, attn_weights
         ori_hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=mask.logical_not(), dropout_p=0.0,
                                                            is_causal=False)  # add mask input,
         return ori_hidden_states
@@ -179,7 +202,7 @@ class SparseProcessAttnAigc_Local0408(ScaledDotProductAttnAigc):
         )
 
 
-    def forward(self, query, key, value, img_len, batch_size, sparse_ratio): #### qkv after retory
+    def forward(self, query, key, value, img_len, batch_size, sparse_ratio, return_attn_weights=False): #### qkv after retory
         # add by yulei.
         ''' args '''
         block_lenth = 64  # num_block = 4096 // 32 = 128 (1024 * 1024)  256 // 32 = 8 (256, 256)
@@ -225,6 +248,11 @@ class SparseProcessAttnAigc_Local0408(ScaledDotProductAttnAigc):
         # print(f"final mask: {mask.shape}")
 
         # add by dkp.
+        if return_attn_weights:
+            ori_hidden_states, attn_weights = _manual_masked_attention(
+                query, key, value, masked_mask=mask
+            )
+            return ori_hidden_states, attn_weights
         if is_torch_npu_available() and query.dtype in (torch.float16, torch.bfloat16):
             ori_hidden_states = torch_npu.npu_fusion_attention(
                 query,

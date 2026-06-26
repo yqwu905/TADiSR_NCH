@@ -321,6 +321,14 @@ class Attention(nn.Module):
             )
         self.set_processor(processor)
 
+        # TACA: when True, processors compute attention with an explicit
+        # softmax + matmul (instead of the fused SDPA kernel) and cache the
+        # resulting attention weights in ``last_attn_weights`` so they can be
+        # harvested by the TACA projection head. Default False keeps the
+        # fused SDPA kernel for the SR baseline path.
+        self.store_attn_weights = False
+        self.last_attn_weights = None
+
     def set_use_xla_flash_attention(
         self,
         use_xla_flash_attention: bool,
@@ -985,9 +993,23 @@ class NCHAttnProcessor2_0:
             query = apply_rotary_emb_qwen_ruduan(query, new_cos, new_sin)
             key = apply_rotary_emb_qwen_ruduan(key, new_cos, new_sin)
 
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        if getattr(attn, "store_attn_weights", False):
+            # Manual attention to expose weights for TACA extraction.
+            attn_weights = torch.matmul(query, key.transpose(-1, -2)) * attn.scale
+            if attention_mask is not None:
+                if attention_mask.dtype == torch.bool:
+                    attn_weights = attn_weights.masked_fill(
+                        attention_mask.logical_not(), float("-inf")
+                    )
+                else:
+                    attn_weights = attn_weights + attention_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1).to(query.dtype)
+            attn.last_attn_weights = attn_weights
+            hidden_states = torch.matmul(attn_weights, value)
+        else:
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
         hidden_states = hidden_states.transpose(1, 2).reshape(
             batch_size, -1, attn.heads * head_dim
         )
@@ -1084,7 +1106,14 @@ class SparseAttnProcessor:
             key = apply_rotary_emb_qwen_ruduan(key, new_cos, new_sin)
 
         ### sparse attn qk compress ###
-        ori_hidden_states = attn.sparse_attn(query, key, value, img_len, batch_size, sparse_ratio)
+        if getattr(attn, "store_attn_weights", False):
+            ori_hidden_states, attn_weights = attn.sparse_attn(
+                query, key, value, img_len, batch_size, sparse_ratio,
+                return_attn_weights=True,
+            )
+            attn.last_attn_weights = attn_weights
+        else:
+            ori_hidden_states = attn.sparse_attn(query, key, value, img_len, batch_size, sparse_ratio)
         hidden_states = ori_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
