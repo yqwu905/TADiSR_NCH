@@ -369,3 +369,62 @@ class NCHMMDiTSROp:
         if isinstance(model_result, (tuple, list)):
             return model_result[0]
         return model_result
+
+
+@register_op("jsd_decode")
+class JSDDecodeOp:
+    """
+    Joint Segmentation Decoder op for TADiSR stage 3.
+
+    Calls a ``JointSegDecoder`` component with the denoised latent and the
+    text-aware attention feature ``a_tex`` produced by the DiT TACA path,
+    writing both the super-resolved image (``recon``) and the text
+    segmentation mask (``seg``) back to context.
+
+    Inputs (under ``inputs``):
+        latent  : denoised latent tensor  [B, C, H, W]
+        a_tex   : text-aware attention    [B, S_img, a_tex_channels]
+
+    Outputs (under ``outputs``):
+        recon   : super-resolved image    [B, 3, H, W]
+        seg     : text segmentation mask  [B, 1, H, W] in [0, 1]
+    """
+
+    def __init__(self, cfg):
+        self.cfg = dict(_plain(cfg))
+        self.component_name = self.cfg.get("component") or self.cfg.get("jsd")
+        if not self.component_name:
+            raise ValueError("jsd_decode requires 'component' or 'jsd'")
+
+    def __call__(self, ctx, components):
+        inputs = dict(self.cfg.get("inputs", {}) or {})
+        if "latent" not in inputs:
+            raise KeyError("jsd_decode inputs must include 'latent'")
+        if "a_tex" not in inputs:
+            raise KeyError("jsd_decode inputs must include 'a_tex'")
+
+        latent = resolve_input(inputs["latent"], ctx)
+        a_tex = resolve_input(inputs["a_tex"], ctx)
+
+        if not torch.is_tensor(latent):
+            raise TypeError(
+                f"jsd_decode latent must resolve to a tensor, got {type(latent)}"
+            )
+        if not torch.is_tensor(a_tex):
+            raise TypeError(
+                f"jsd_decode a_tex must resolve to a tensor, got {type(a_tex)}"
+            )
+
+        a_tex = a_tex.to(device=latent.device, dtype=latent.dtype)
+
+        model = components[self.component_name]
+        result = model(latent, a_tex)
+
+        outputs = self.cfg.get("outputs")
+        if outputs is not None:
+            _write_outputs(ctx, result, outputs)
+        else:
+            recon = result["recon"] if isinstance(result, dict) else result
+            ctx.set(self.cfg.get("recon_output", "pred.rgb"), recon)
+            if isinstance(result, dict) and "seg" in result:
+                ctx.set(self.cfg.get("seg_output", "pred.seg"), result["seg"])

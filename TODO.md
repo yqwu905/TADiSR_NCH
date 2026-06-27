@@ -143,22 +143,30 @@
 
 ---
 
-## 阶段 3：JSD 分割解码器（待实现）
+## 阶段 3：JSD 分割解码器（已实现，CPU smoke 验证完成）
 
-### 3.1 JSD 组件 ⬜
-- [ ] 新增 `models/vae/npu/jsd.py` — Joint Segmentation Decoder
-- [ ] 图像分支：复用 Decoder 结构 + 加载 VAE 权重
-- [ ] 分割分支：随机初始化的对称 Decoder
-- [ ] CDIB（Cross-Decoder Interaction Block）：双分支交互
-  - ResBlock → 1×1 Conv → Split → Hadamard × Sigmoid → GroupNorm + SiLU + 1×1 Conv → 零初始化残差
+### 3.1 JSD 组件 ✅
+- [x] 新增 `models/vae/npu/jsd.py` — `JointSegDecoder` + `CDIB`
+- [x] 图像分支：复用 `mj64_vae.Decoder` 结构，支持 `image_checkpoint` 加载 VAE 权重
+- [x] 分割分支：随机初始化的对称 `Decoder`（`seg_channels=1`，sigmoid 输出 mask）
+- [x] CDIB（Cross-Decoder Interaction Block）：双分支交互
+  - ResBlock → 1×1 Conv(2C) → Split → Hadamard × Sigmoid(交叉半) → GroupNorm + SiLU + 1×1 Conv → 零初始化残差（`scale_img`/`scale_seg` init 0，训练初期为 identity）
+- [x] CDIB 按 up-sampling level 插入，每个 level 的 channels 按 `ch*ch_mult[level]` 自动匹配（默认 `[4,3,2,1]`）
+- [x] a_tex 序列→空间 reshape：`[B,S_img,C]` → 推断 patch 网格 → `interpolate` 对齐 latent 空间
+- [x] image branch 输出应用 VAE scaling（`1/SCALING_FACTOR * out + SHIFTING_FACTOR`），与 `VaeDecoder` 一致
 
-### 3.2 seg_decode op ⬜
-- [ ] 新增 op：输入 latent + a_tex → `pred.seg`
-- [ ] 在训练配置中添加 seg_decode 组件
+### 3.2 jsd_decode op ✅
+- [x] 新增 `jsd_decode` op（`framework/ops/diffusion.py`）：输入 latent + a_tex → `pred.rgb` + `pred.seg`
+- [x] 在 `configs/tadisr_jsd.yaml` 添加 JSD 组件，DiT 开启 `taca_cfg`（`extract_a_tex=true`）
 
-### 3.3 验证 ⬜
-- [ ] Colab GPU smoke：JSD 输出 seg shape 正确
-- [ ] 图像分支不破坏 VAE decode 质量
+### 3.3 验证 ✅
+- [x] `compileall` 全部通过（framework/test_assets/tests/models）
+- [x] 51 个 unittest 全部通过（含 12 个 JSD 测试：CDIB 零初始化 identity/shape/梯度、
+      JSD 输出 shape/seg 范围/a_tex_channels 灵活/梯度流/错误 seq len/默认 cdib_levels/
+      无 CDIB 时 image branch == VAE decode、op 胶水/错误处理）
+- [x] 端到端 CPU smoke 训练 2 步成功（4 层 DiT + TACA extract + JSD，loss 0.44→0.13 正常下降）
+- [x] JSD 参数量 170.765M（两个 VAE Decoder + 4 CDIB），DiT 4 层 367.078M
+- [ ] Colab GPU smoke（JSD 在 512/1024 分辨率下的显存与质量验证）
 
 ---
 
