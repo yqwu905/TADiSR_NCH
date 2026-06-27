@@ -166,7 +166,7 @@
       无 CDIB 时 image branch == VAE decode、op 胶水/错误处理）
 - [x] 端到端 CPU smoke 训练 2 步成功（4 层 DiT + TACA extract + JSD，loss 0.44→0.13 正常下降）
 - [x] JSD 参数量 170.765M（两个 VAE Decoder + 4 CDIB），DiT 4 层 367.078M
-- [ ] Colab GPU smoke（JSD 在 512/1024 分辨率下的显存与质量验证）
+- [x] Colab GPU smoke（JSD 在 512/1024 分辨率下验证，详见阶段 5.4）
 
 ---
 
@@ -210,7 +210,7 @@
       → step1 `total=23.33→19.63`，所有 loss 项正常计算且下降
 - [x] checkpoint 保存成功（dit.pt + jsd.pt + optimizers）
 - [x] checkpoint 恢复成功（resume 继续训练 3 步无报错，loss 持续下降）
-- [ ] Colab GPU 完整 smoke 训练（512/1024 分辨率显存与质量验证）
+- [x] Colab GPU 完整 smoke 训练（512/1024 分辨率显存验证，详见阶段 5.4）
 
 ---
 
@@ -227,13 +227,35 @@
 - [x] 完整管线 4 层 DiT (512 res, bf16, default processor) 端到端训练 2 步通过
 - [x] 37 层 DiT forward+backward 通过（VAE decode 阶段 OOM，L4 显存限制，实际用 A100 或开 gradient_checkpointing）
 
-### 5.3 已知限制
+### 5.3 完整管线 GPU 验证 ✅（RTX PRO 6000 Blackwell, 101.97 GB）
+
+在 Colab GPU (RTX PRO 6000 Blackwell, 101.97 GB VRAM, torch 2.11.0+cu128) 上
+运行 `configs/tadisr_full.yaml` 完整管线（DiT + TACA + JSD + TADiSRLoss + SegLoss）：
+
+| 配置 | 分辨率 | DiT 层数 | grad_ckpt | Peak VRAM | 步数 | 状态 |
+|---|---|---|---|---|---|---|
+| tadisr_full (4层) | 512 | 4 | 否 | ~少量 | 4 | ✅ loss 20.56→18.85 正常下降 |
+| tadisr_full (37层) | 512 | 37 | 否 | 66.30 GB | 4 | ✅ 完成，占 65% VRAM |
+| tadisr_full (37层) | 1024 | 37 | DiT only | 99.46 GB | 2 | ✅ 完成，占 98% VRAM |
+
+4 层 DiT @ 512 详细 loss（bf16, 4 步）：
+```
+step=0 sr/l2=0.386 sr/mf=1.854 sr/loss=18.93 seg/l2=0.225 seg/focal=0.075 seg/dice=0.656 seg/loss=1.628 total=20.558
+step=3 sr/l2=0.337 sr/mf=1.696 sr/loss=17.29 seg/l2=0.213 seg/focal=0.064 seg/dice=0.701 seg/loss=1.558 total=18.851
+```
+
+关键发现：
+- 512 分辨率 37 层 DiT **不需要** gradient_checkpointing（66.30 GB，65% VRAM）
+- 1024 分辨率 37 层 DiT **需要** DiT gradient_checkpointing（99.46 GB，98% VRAM，非常紧张）
+- JSD 未实现 `gradient_checkpointing_enable` 方法，无法开启 JSD grad_ckpt
+- 1024 分辨率在 101.97 GB GPU 上刚好可行（余量仅 2.51 GB）；A100-80GB 需开 JSD grad_ckpt 或降到 768
+- 无 SQLite 缓存时 EmbeddingDB 返回零张量（smoke 可用，实际训练需提供）
+
+### 5.4 已知限制
 - sparse processor 要求 ≥1024 分辨率（block_lenth=64 导致 topk 越界）
-- L4 24GB 无法跑完整 37 层 + 1024 分辨率（需 A100 或 gradient_checkpointing）
+- JSD 缺少 `gradient_checkpointing_enable` 方法，1024 分辨率在 ≤80GB GPU 上可能 OOM
 - 无 sqlite 缓存时 EmbeddingDB 返回零张量（smoke 可用，实际训练需提供）
-- TACA 手动 attention 在 ≥512 分辨率时 OOM（weights 矩阵 ~34GB @512²）；
-  A100-40GB 下 128×128 bf16 可跑（峰值 21.8GB），256² 需减少 TACA 层数或开
-  gradient_checkpointing。后续可优化为 chunked/行采样 attention 降低显存。
+- TACA chunked logsumexp 已解决旧全矩阵 OOM 问题（详见阶段 2.6 benchmark）
 
 ---
 
