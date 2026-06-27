@@ -170,26 +170,47 @@
 
 ---
 
-## 阶段 4：完整 Loss + 训练（待实现）
+## 阶段 4：完整 Loss + 训练（已实现，CPU smoke 验证完成）
 
-### 4.1 TADiSRLoss ⬜
-- [ ] 新增 `models/loss/tadisr_loss.py`
-- [ ] L2 + 5.0·LPIPS + 10.0·modified_focal（Sobel 边缘）
-- [ ] modified focal: `‖[1 - ŝ∘s - (1-ŝ)∘(1-s)]^γ ∘ (∇x̂ - ∇x)²‖₁`
+### 4.1 TADiSRLoss ✅
+- [x] 新增 `models/loss/tadisr_loss.py` — `TADiSRLoss`（论文 Eq. 7-8）
+- [x] L2（MSE）+ 5.0·LPIPS + 10.0·modified_focal（Sobel 边缘）
+- [x] modified focal: `‖[1 - ŝ∘s - (1-ŝ)∘(1-s)]^γ ∘ (∇x̂ - ∇x)²‖₁`
+  - Sobel 算子：固定 3×3 Gx/Gy kernel（grouped conv，逐通道），reflect padding
+  - 误分类权重 `[1 - P(correct)]^γ`，γ 默认 2.0（Lin2017focal），可配置
+  - ∇x 为梯度向量 (Gx, Gy)，`(∇x̂-∇x)² = (Gx̂-Gx)² + (Gŷ-Gy)²`，逐通道
+  - reduction 默认 mean（与 MSE 一致），可选 sum
+- [x] LPIPS 优雅降级：无 `lpips` 包时自动禁用（CPU smoke 可跑）
+- [x] pred_seg/target_seg 可选：未提供时跳过 mf 项（兼容纯 SR 场景）
+- [x] 返回 `{"loss", "l2", "lpips", "mf"}`，metrics 自动记录
 
-### 4.2 SegLoss ⬜
-- [ ] 新增 `models/loss/seg_loss.py`
-- [ ] L2 + 10.0·Focal + 1.0·Dice
+### 4.2 SegLoss ✅
+- [x] 新增 `models/loss/seg_loss.py` — `SegLoss`（论文 Eq. 9）
+- [x] L2（MSE）+ 10.0·Focal + 1.0·Dice
+- [x] Focal：`-α_t·(1-p_t)^γ·log(p_t)`，γ 默认 2.0，α 默认 0.25（RetinaNet）
+- [x] Dice：`1 - 2|p∩g|/(|p|+|g|+smooth)`，soft dice，smooth=1.0
+- [x] 概率 clamp 防 log(0)，返回 `{"loss", "l2", "focal", "dice"}`
 
-### 4.3 完整训练配置 ⬜
-- [ ] `configs/tadisr_full.yaml` — 多 loss + DiT + SegDecoder 联合训练
-- [ ] Phase: vae_encode → text_encode → dit_sr → vae_decode + seg_decode → sr_loss + seg_loss
-- [ ] lr=5e-5, AdamW, DiT + SegDecoder 联合优化
+### 4.3 完整训练配置 ✅
+- [x] `configs/tadisr_full.yaml` — 多 loss + DiT + JSD 联合训练
+- [x] Phase: vae_encode → text_encode → dit_sr(extract_a_tex) → jsd_decode → rescale_hr → sr_loss + seg_loss
+- [x] `rescale` op（`framework/ops/common.py` 新增）：`out = scale·input + shift`，把 GT HR 从 [0,1] 对齐到 VAE 解码器输出的 [-1,1]
+- [x] lr=5e-5, AdamW, DiT + JSD 双 optimizer 联合优化
+- [x] LPIPS 默认关闭（w_lpips=0，CPU smoke），实际训练设 5.0
 
-### 4.4 验证 ⬜
-- [ ] Colab GPU 完整 smoke 训练
-- [ ] 所有 loss 项正常计算
-- [ ] checkpoint 保存/加载
+### 4.4 验证 ✅
+- [x] `compileall` 全部通过（framework/test_assets/tests/models/data/scripts）
+- [x] 67 个 unittest 全部通过（含 17 个新增 loss/rescale 测试：
+      TADiSRLoss 8 个：返回 dict/非负、零边缘差→mf=0、一致 seg→mf=0、
+      不一致 seg 放大 mf、无 seg 跳过 mf、梯度流、空间不匹配报错；
+      SegLoss 7 个：返回 dict、完美预测小 loss、dice 范围、focal 非负、
+      梯度流、通道/空间不匹配报错；rescale op 2 个）
+- [x] 端到端 CPU smoke 训练 2 步成功（256 分辨率，4 层 DiT + TACA + JSD）：
+      `sr/l2=0.379 sr/mf=2.098 seg/l2=0.253 seg/focal=0.109 seg/dice=0.624`
+      → step1 `total=23.33→19.63`，所有 loss 项正常计算且下降
+- [x] checkpoint 保存成功（dit.pt + jsd.pt + optimizers）
+- [x] checkpoint 恢复成功（resume 继续训练 3 步无报错，loss 持续下降）
+- [ ] Colab GPU 完整 smoke 训练（512/1024 分辨率显存与质量验证）
 
 ---
 

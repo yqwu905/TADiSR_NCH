@@ -108,6 +108,29 @@ class DetachOp:
         value = ctx.get(self.cfg["input"])
         ctx.set(self.cfg["output"], value.detach())
 
+
+@register_op("rescale")
+class RescaleOp:
+    """Affine transform on a context tensor: ``out = scale * input + shift``.
+
+    Useful for aligning value ranges, e.g. rescaling a ``[0, 1]`` GT image
+    to ``[-1, 1]`` (``scale=2.0, shift=-1.0``) to match a VAE decoder
+    output before feeding a perceptual / pixel loss.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = dict(_plain(cfg))
+        self.scale = float(self.cfg.get("scale", 1.0))
+        self.shift = float(self.cfg.get("shift", 0.0))
+
+    def __call__(self, ctx, components):
+        value = resolve_input(self.cfg["input"], ctx)
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"rescale expects a tensor, got {type(value)}"
+            )
+        ctx.set(self.cfg["output"], value * self.scale + self.shift)
+
 @register_op("save_image")
 class SaveImageOp:
     def __init__(self, cfg):

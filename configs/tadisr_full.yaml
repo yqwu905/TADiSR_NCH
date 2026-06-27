@@ -1,0 +1,261 @@
+# TADiSR Stage-4 full training config.
+#
+# Implements the complete TADiSR loss (NeurIPS 2025, arXiv:2506.04641,
+# Eq. 7-9) with joint DiT + JSD optimization:
+#
+#   ell_img = ||x_hat - x||^2_2 + 5.0*LPIPS + 10.0*modified_focal
+#   ell_seg = ||s_hat - s||^2_2 + 10.0*Focal + 1.0*Dice
+#   ell_tot = ell_img + ell_seg
+#
+# Pipeline (single phase):
+#   vae_encode(batch.lr)                       -> lq.latent
+#   text_encode(batch.prompt)                  -> encoder_hidden_states
+#   dit_sr(lq.latent, ehs, extract_a_tex=true) -> pred.latent_denoised + pred.a_tex
+#   jsd_decode(pred.latent_denoised, pred.a_tex)-> pred.rgb + pred.seg
+#   rescale_hr(batch.hr, 2*x-1)                -> batch.hr_norm   # [0,1]->[-1,1]
+#   sr_loss(pred.rgb, batch.hr_norm, pred.seg, batch.mask)
+#   seg_loss(pred.seg, batch.mask)
+#
+# The JSD image branch decodes into the VAE output range (~[-1, 1]); the GT
+# HR image from the dataset is [0, 1], so a `rescale` op aligns the GT to
+# [-1, 1] before the pixel/LPIPS/Sobel-edge comparison.  The segmentation
+# masks stay in [0, 1] on both sides.
+#
+# LPIPS is disabled by default (w_lpips=0) so the config runs on CPU
+# without the `lpips` package; set w_lpips=5.0 for real training.
+#
+# All components use random init when checkpoint paths are absent, so this
+# config runs end-to-end on CPU for smoke testing.  DiT is trimmed to 4
+# layers for CPU speed; restore num_layers=37 (and the full
+# layers_to_retained / topK) for real training.
+
+experiment:
+  name: tadisr_full
+  output_dir: output/tadisr_full
+
+runtime:
+  device: cpu
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+  distributed:
+    strategy: none
+
+train:
+  max_steps: 2
+  max_epochs: 1
+  log_every: 1
+
+data:
+  train:
+    dataset:
+      target: data.tadisr_dataset.TADiSRDataset
+      params:
+        data_root: null              # null => synthetic random data for smoke
+        hr_size: 512
+        lr_size: 128                 # 4x downsampling
+        length: 4
+        seed: 42
+    dataloader:
+      batch_size: 1
+      shuffle: true
+      num_workers: 0
+      drop_last: false
+      collate_fn:
+        target: data.tadisr_dataset.TADiSRCollateFn
+
+components:
+  vae_encoder:
+    target: models.vae.npu.f16c64.VaeEncoder
+    params:
+      z_channels: 64
+      resolution: 512
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+
+  offline_embedding:
+    target: models.text_encoder.offline_embedding.EmbeddingDB
+    params:
+      embedding_cache_path: embedding_pangu_1b_vl.sqlite
+      task_tokens: dehalo
+      trainable_vector_cfg:
+        target: models.text_encoder.nch.utils_nch.TrainableVector_multitask
+        params:
+          dehalo_fix_tokens: true
+          token_requires_grad: true
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+
+  dit:
+    target: models.dit.nch.ldm.transformer_nch_v3_split.NCHTransformer2DModel
+    params:
+      patch_size: 1
+      in_channels: 1024
+      out_channels: 256
+      num_layers: 4
+      attention_head_dim: 384
+      num_attention_heads: 4
+      joint_attention_dim: 1536
+      pooled_projection_dim: 768
+      guidance_embeds: false
+      axes_dims_rope: [48, 168, 168]
+      processor_type: default
+      ffn_ratio: 4
+      adaln_dim: 1536
+      block_lenth: 64
+      topK: [0.8333, 0.8333, 0.8333, 0.8333]
+      layers_to_retained:
+        "100":
+          transformer_blocks: [0, 1, 2, 3]
+      taca_cfg:
+        enabled: true
+        taca_layers: [1, 2, 3]
+        text_token_indices: [8]
+        query_chunk_size: 1024
+        use_checkpoint: false
+        out_dim: 64
+    strict: false
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+  jsd:
+    target: models.vae.npu.jsd.JointSegDecoder
+    params:
+      z_channels: 64
+      a_tex_channels: 64
+      resolution: 512
+      ch: 128
+      in_channels: 3
+      seg_channels: 1
+      cdib_levels: [4, 3, 2, 1]
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+optimizers:
+  dit_optim:
+    type: adamw
+    lr: 5.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - dit
+  jsd_optim:
+    type: adamw
+    lr: 5.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - jsd
+
+losses:
+  sr:
+    target: models.loss.tadisr_loss.TADiSRLoss
+    params:
+      w_l2: 1.0
+      w_lpips: 0.0            # set to 5.0 for real training (needs lpips pkg)
+      w_mf: 10.0
+      focal_gamma: 2.0
+    inputs:
+      pred: pred.rgb
+      target: batch.hr_norm
+      pred_seg: pred.seg
+      target_seg: batch.mask
+    weight: 1.0
+  seg:
+    target: models.loss.seg_loss.SegLoss
+    params:
+      w_l2: 1.0
+      w_focal: 10.0
+      w_dice: 1.0
+      focal_gamma: 2.0
+      focal_alpha: 0.25
+    inputs:
+      pred: pred.seg
+      target: batch.mask
+    weight: 1.0
+
+train_program:
+  phases:
+    - name: generator
+      trainable: [dit, jsd]
+      zero_grad: [dit_optim, jsd_optim]
+      backward: true
+      step: [dit_optim, jsd_optim]
+      ops:
+        vae_encode:
+          component: vae_encoder
+          inputs:
+            x: batch.lr
+          outputs:
+            latent: lq.latent
+        text_encode:
+          component: offline_embedding
+          method: get_embedding
+          inputs:
+            text: batch.prompt
+            model_id:
+              type: const
+              value: pangu_1b_vl
+          outputs:
+            encoder_hidden_states: encoder_hidden_states
+        dit_sr:
+          type: nch_mmdit_sr
+          component: dit
+          input_type: lq
+          timestep: 1.0
+          mask_repeat: 2
+          enable_skip_level: "100"
+          denoise: true
+          extract_a_tex: true
+          inputs:
+            latent: lq.latent
+            encoder_hidden_states: encoder_hidden_states
+          outputs:
+            latent_denoised: pred.latent_denoised
+            a_tex: pred.a_tex
+        jsd_decode:
+          type: jsd_decode
+          component: jsd
+          inputs:
+            latent: pred.latent_denoised
+            a_tex: pred.a_tex
+          outputs:
+            recon: pred.rgb
+            seg: pred.seg
+        rescale_hr:
+          type: rescale
+          input: batch.hr
+          scale: 2.0
+          shift: -1.0
+          output: batch.hr_norm
+      losses:
+        - sr
+        - seg
+
+logging:
+  reduce_metrics: true
+  backends:
+    tensorboard:
+      enabled: false
+      log_dir: null
+    aim:
+      enabled: false
+    wandb:
+      enabled: false
+  images:
+    enabled: false
+
+profiling:
+  enabled: false
+
+checkpoint:
+  save_every_steps: 0
+  save_optimizer: true
+  save_scheduler: true
