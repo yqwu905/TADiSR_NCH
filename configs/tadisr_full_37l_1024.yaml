@@ -100,7 +100,12 @@ components:
       pooled_projection_dim: 768
       guidance_embeds: false
       axes_dims_rope: [48, 168, 168]
-      processor_type: sparse
+      processor_type: default       # default processor supports TACA extract
+                                   # (chunked-logsumexp side path). SparseAttnProcessor
+                                   # does not implement taca_slice harvesting; using
+                                   # sparse would silently yield a_tex=None and break
+                                   # the make_heatmap op. SDPA on 1024 latent (S=4096)
+                                   # is fine in ~95GB VRAM.
       ffn_ratio: 4
       adaln_dim: 1536
       block_lenth: 64
