@@ -252,8 +252,8 @@ train_program:
         make_taca_heatmap:
           type: make_heatmap
           input: pred.a_tex
-          grid_h: 64                  # 1024 px / VAE-16 = 64 latent grid
-          grid_w: 64
+          grid_h: 32                  # 1024 px / VAE downscale-32 = 32 latent grid
+          grid_w: 32
           target_h: 1024
           target_w: 1024
           reduce: norm
