@@ -274,12 +274,12 @@ logging:
     every_n_steps: 100
     max_images: 1                    # batch_size=1
     items:
-      - { tag: lq,          key: batch.lr,          value_range: 0_1,   max_images: 1 }
-      - { tag: gt,          key: batch.hr,          value_range: 0_1,   max_images: 1 }
-      - { tag: gt_mask,      key: batch.mask,        value_range: 0_1,   max_images: 1 }
-      - { tag: pred_rgb,     key: pred.rgb,         value_range: -1_1,  max_images: 1 }
-      - { tag: pred_seg,      key: pred.seg,         value_range: 0_1,   max_images: 1 }
-      - { tag: taca_heatmap,  key: pred.taca_heatmap,value_range: 0_1,   max_images: 1 }
+      - { tag: lq,           key: batch.lr,           value_range: "0_1",  max_images: 1 }
+      - { tag: gt,           key: batch.hr,           value_range: "0_1",  max_images: 1 }
+      - { tag: gt_mask,      key: batch.mask,         value_range: "0_1",  max_images: 1 }
+      - { tag: pred_rgb,     key: pred.rgb,           value_range: "-1_1", max_images: 1 }
+      - { tag: pred_seg,     key: pred.seg,           value_range: "0_1",  max_images: 1 }
+      - { tag: taca_heatmap, key: pred.taca_heatmap,  value_range: "0_1",  max_images: 1 }
 
 profiling:
   enabled: false
