@@ -145,6 +145,7 @@ components:
       strategy: full
     mode: train
     save: full
+    gradient_checkpointing: true       # needed at 1024 on <=96GB GPU
 
 optimizers:
   dit_optim:
