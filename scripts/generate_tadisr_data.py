@@ -42,7 +42,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 DIV2K_TRAIN_URL = (
-    "http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip"
+    "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip"
 )
 
 # A small curated subset of OFL fonts hosted in github.com/google/fonts.
@@ -111,6 +111,7 @@ PHRASE_BANK = [
 
 def download_div2k(target_dir: Path, force: bool = False) -> Path:
     """Download and extract DIV2K train HR. Returns the HR directory."""
+    target_dir.mkdir(parents=True, exist_ok=True)
     hr_dir = target_dir / "DIV2K_train_HR"
     if hr_dir.exists() and any(hr_dir.glob("*.png")) and not force:
         print(f"[div2k] already extracted at {hr_dir}")
