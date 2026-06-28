@@ -13,11 +13,12 @@ NeurIPS 2025, arXiv:2506.04641), Section 3.3.
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from .mj64_vae import Decoder, Normalize, ResnetBlock, nonlinearity
 
@@ -134,6 +135,7 @@ class JointSegDecoder(nn.Module):
         self.a_tex_channels = int(a_tex_channels)
         self.in_channels = int(in_channels)
         self.seg_channels = int(seg_channels)
+        self.gradient_checkpointing = False
 
         block_in = ch * _CH_MULT[-1]
         if block_in % self.a_tex_channels != 0:
@@ -168,6 +170,17 @@ class JointSegDecoder(nn.Module):
 
         if image_checkpoint:
             self._load_image_checkpoint(image_checkpoint)
+
+    def gradient_checkpointing_enable(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = bool(enabled)
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.gradient_checkpointing = False
+
+    def _ckpt(self, fn: Any, *args: Any) -> Any:
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            return _torch_checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def _load_image_checkpoint(self, path: str) -> None:
         sd = torch.load(path, map_location="cpu")
@@ -218,29 +231,29 @@ class JointSegDecoder(nn.Module):
         a_spatial = self._a_tex_to_spatial(a_tex, latent.shape)
 
         h_img = self.image_decoder.conv_in(latent)
-        h_img = self.image_decoder.mid.block_1(h_img, None)
-        h_img = self.image_decoder.mid.attn_1(h_img)
-        h_img = self.image_decoder.mid.block_2(h_img, None)
+        h_img = self._ckpt(self.image_decoder.mid.block_1, h_img, None)
+        h_img = self._ckpt(self.image_decoder.mid.attn_1, h_img)
+        h_img = self._ckpt(self.image_decoder.mid.block_2, h_img, None)
 
         h_seg = self.seg_decoder.conv_in(a_spatial)
-        h_seg = self.seg_decoder.mid.block_1(h_seg, None)
-        h_seg = self.seg_decoder.mid.attn_1(h_seg)
-        h_seg = self.seg_decoder.mid.block_2(h_seg, None)
+        h_seg = self._ckpt(self.seg_decoder.mid.block_1, h_seg, None)
+        h_seg = self._ckpt(self.seg_decoder.mid.attn_1, h_seg)
+        h_seg = self._ckpt(self.seg_decoder.mid.block_2, h_seg, None)
 
         num_res = self.image_decoder.num_resolutions
         for i_level in reversed(range(num_res)):
             n_blocks = self.image_decoder.num_res_blocks[i_level] + 1
             for i_block in range(n_blocks):
-                h_img = self.image_decoder.up[i_level].block[i_block](h_img, None)
+                h_img = self._ckpt(self.image_decoder.up[i_level].block[i_block], h_img, None)
                 if len(self.image_decoder.up[i_level].attn) > 0:
-                    h_img = self.image_decoder.up[i_level].attn[i_block](h_img)
-                h_seg = self.seg_decoder.up[i_level].block[i_block](h_seg, None)
+                    h_img = self._ckpt(self.image_decoder.up[i_level].attn[i_block], h_img)
+                h_seg = self._ckpt(self.seg_decoder.up[i_level].block[i_block], h_seg, None)
                 if len(self.seg_decoder.up[i_level].attn) > 0:
-                    h_seg = self.seg_decoder.up[i_level].attn[i_block](h_seg)
+                    h_seg = self._ckpt(self.seg_decoder.up[i_level].attn[i_block], h_seg)
 
             key = str(i_level)
             if key in self.cdib:
-                h_img, h_seg = self.cdib[key](h_img, h_seg)
+                h_img, h_seg = self._ckpt(self.cdib[key], h_img, h_seg)
 
             if i_level != 0:
                 h_img = self.image_decoder.up[i_level].upsample(h_img)

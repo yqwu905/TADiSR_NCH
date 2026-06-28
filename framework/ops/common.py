@@ -131,6 +131,94 @@ class RescaleOp:
             )
         ctx.set(self.cfg["output"], value * self.scale + self.shift)
 
+@register_op("make_heatmap")
+class MakeHeatmapOp:
+    """Reduce a context tensor along its last non-batch dim into a spatial
+    heatmap suitable for image logging.
+
+    Typical use: ``pred.a_tex`` has shape ``[B, S_img, C]`` produced by the
+    DiT TACA path (one attention-derived feature vector per image patch).
+    This op collapses the feature dimension via L2-norm (or mean), reshapes
+    to ``[B, 1, grid_h, grid_w]``, optionally interpolates to a target
+    spatial size, and writes a min-max normalized ``[0, 1]`` single-channel
+    tensor back to context. That tensor can then be picked up by the
+    framework's image logger (``logging.images.items[]``) for TensorBoard.
+
+    Config keys:
+        input       : ctx key pointing to the source tensor ([B, S, C] or
+                      any tensor whose trailing dim holds the feature axis)
+        grid_h      : optional int, patch grid height (auto-inferred when
+                      omitted via sqrt(S))
+        grid_w      : optional int, patch grid width (auto-inferred)
+        target_h    : optional int, interpolate to this height (default grid_h)
+        target_w    : optional int, interpolate to this width  (default grid_w)
+        reduce      : "norm" (default) or "mean" along the feature axis
+        normalize   : bool, min-max reshape to [0, 1] per sample (default true)
+        output      : ctx key for result (default "pred.heatmap")
+    """
+
+    def __init__(self, cfg):
+        self.cfg = dict(_plain(cfg))
+
+    def __call__(self, ctx, components):
+        value = resolve_input(self.cfg["input"], ctx)
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"make_heatmap expects a tensor, got {type(value)}"
+            )
+
+        reduce_mode = str(self.cfg.get("reduce", "norm")).lower()
+        grid_h = self.cfg.get("grid_h")
+        grid_w = self.cfg.get("grid_w")
+        target_h = self.cfg.get("target_h", grid_h)
+        target_w = self.cfg.get("target_w", grid_w)
+        normalize = bool(self.cfg.get("normalize", True))
+
+        x = value.detach()
+
+        if reduce_mode == "norm":
+            heat = torch.norm(x.float(), dim=-1)
+        elif reduce_mode == "mean":
+            heat = x.float().mean(dim=-1)
+        else:
+            raise ValueError(f"unknown reduce mode: {reduce_mode!r}")
+
+        if heat.ndim == 1:
+            heat = heat.unsqueeze(0)
+
+        if grid_h is None or grid_w is None:
+            s = int(heat.shape[-1])
+            side = int(round(s ** 0.5))
+            if side * side != s:
+                raise ValueError(
+                    f"make_heatmap cannot auto-infer grid for S={s}; "
+                    f"please pass grid_h/grid_w explicitly"
+                )
+            grid_h = grid_h or side
+            grid_w = grid_w or side
+
+        heat = heat.reshape(heat.shape[0], 1, int(grid_h), int(grid_w))
+
+        th = int(target_h) if target_h is not None else int(grid_h)
+        tw = int(target_w) if target_w is not None else int(grid_w)
+        if (th, tw) != (int(grid_h), int(grid_w)):
+            heat = torch.nn.functional.interpolate(
+                heat, size=(th, tw), mode="bilinear", align_corners=False
+            )
+
+        if normalize:
+            for b in range(heat.shape[0]):
+                lo = float(heat[b].min())
+                hi = float(heat[b].max())
+                rng = hi - lo
+                if rng > 1e-8:
+                    heat[b] = (heat[b] - lo) / rng
+                else:
+                    heat[b] = heat[b] * 0.0
+
+        ctx.set(self.cfg.get("output", "pred.heatmap"), heat)
+
+
 @register_op("save_image")
 class SaveImageOp:
     def __init__(self, cfg):

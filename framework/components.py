@@ -606,6 +606,12 @@ class ComponentManager:
     def items(self):
         return ((name, entry.module) for name, entry in self.entries.items())
 
+    def keys(self):
+        return self.entries.keys()
+
+    def __iter__(self):
+        return iter(self.entries)
+
     def set_initial_modes(self):
         for name, entry in self.entries.items():
             mode = entry.cfg.get("mode")
