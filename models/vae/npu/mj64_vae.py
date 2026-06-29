@@ -31,14 +31,10 @@ class PixelUnshuffleChannelAveragingDownSampleLayer(nn.Module):
         self.group_size = in_channels * factor**2 // out_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print("PPPPPPPPPixel unshuffle: in averaging shortcut, ori  x shape:", x.shape)
         x = tnf.pixel_unshuffle(x, self.factor)
-        # print("we are at here when x.shape length is 4::::x resized(unshuffle shape): ", x.shape)
         B, C, H, W = x.shape
         x = x.view(B, self.out_channels, self.group_size, H, W)
-        # print("2d x shape after view", x.shape )
         x = x.mean(dim=2)
-        # print("2d x shape after mean:", x.shape, " shortcut forward ends")
         return x
 
 
@@ -57,14 +53,9 @@ class PixelUnshuffleChannelAveragingDownSampleLayer_convout(nn.Module):
         self.group_size = in_channels * factor**2 // out_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print("in averaging shortcut, ori  x shape:", x.shape)
-        # x = tnf.pixel_unshuffle(x, self.factor)
-        # print("x resized(unshuffle shape): ", x.shape)
         B, C, H, W = x.shape
         x = x.view(B, self.out_channels, self.group_size, H, W)
-        # print("x shape after view", x.shape )
         x = x.mean(dim=2)
-        # print("x shape after mean:", x.shape, " shortcut forward ends")
         return x
 
 
@@ -84,11 +75,8 @@ class ChannelDuplicatingPixelUnshuffleUpSampleLayer_2d(nn.Module):
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print("CCCCCCCCChannel duplicate: in duplicate shortcut, ori  x shape:", x.shape)
         x = x.repeat_interleave(self.repeats, dim=1)
-        # print("x repeat shape: ", x.shape)
         x = tnf.pixel_shuffle(x, self.factor)
-        # print("x shape after shuffle:", x.shape, " shortcut forward ends")
         return x
 
 
@@ -106,12 +94,8 @@ class Encode_conv_out_shortcut(nn.Module):
         self.shortcut = PixelUnshuffleChannelAveragingDownSampleLayer_convout(in_channels, 2*z_channels if double_z else z_channels, factor=1)
 
     def forward(self, x):
-        # print("VVVVVVVVVVVVVVVVVVVVVVVVVVVVvery important x shape:", x.shape)
         sh = self.shortcut(x)
-        # x = tnf.pad(x, (1,1,1,1,2,0), mode="constant", value=0)
-        # print(x.shape)
         x = self.conv(x)
-        # print("VVVVVVVVVVVVVVVVVVVVVVVVVVVVvery important:", sh.shape, x.shape)
         x = x + sh
         return x
 
@@ -131,12 +115,8 @@ class Decode_conv_in_shortcut(nn.Module):
         self.shortcut = ChannelDuplicatingPixelUnshuffleUpSampleLayer_2d(z_channels, in_channels, factor=1)
 
     def forward(self, x):
-        # print("VVVVVVVVVVVVVVVVVVVVVVVVVVVVvery important x shape:", x.shape)
         sh = self.shortcut(x)
-        # x = tnf.pad(x, (1,1,1,1,2,0), mode="constant", value=0)
-        # print(x.shape)
         x = self.conv(x)
-        # print("VVVVVVVVVVVVVVVVVVVVVVVVVVVVvery important:", sh.shape, x.shape)
         x = x + sh
         return x
 
@@ -154,13 +134,10 @@ class Upsample_shortcut(nn.Module):
         self.shortcut = ChannelDuplicatingPixelUnshuffleUpSampleLayer_2d(in_channels, in_channels, factor=2)
 
     def forward(self, x):
-        # print("UUUUUUUUUUUUUpsample22222d: before any interpolation shape: ", x.shape)
         sh = self.shortcut(x)
         x = tnf.interpolate(x, scale_factor=2.0, mode="nearest")
-        # print("after frist interpo", x.shape)
         if self.with_conv:
             x = self.conv(x) + sh
-            # print("after conv ", x.shape)
         return x
 
 
@@ -514,7 +491,6 @@ class Decoder(nn.Module):
 
         # timestep embedding
         temb = None
-        # print('dec', z.dtype)
         # z to block_in
         h = self.conv_in(z)
 

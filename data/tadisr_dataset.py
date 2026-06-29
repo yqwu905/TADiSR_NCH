@@ -183,17 +183,3 @@ class TADiSRCollateFn:
 
     def __call__(self, batch):
         return tadisr_collate_fn(batch)
-
-
-if __name__ == "__main__":
-    ds = TADiSRDataset(data_root=None, hr_size=512, length=4)
-    print(f"Dataset size: {len(ds)}")
-    s = ds[0]
-    for k, v in s.items():
-        if isinstance(v, torch.Tensor):
-            print(f"  {k}: {v.shape} {v.dtype}")
-        else:
-            print(f"  {k}: {v!r}")
-    batch = tadisr_collate_fn([ds[0], ds[1]])
-    print(f"batch prompt: {batch['prompt']}")
-    print(f"batch lr: {batch['lr'].shape}")

@@ -122,14 +122,9 @@ class SparseProcessAttnAigc(ScaledDotProductAttnAigc):
         key_image_block = self.split_and_squeeze(key_image, block_lenth=block_lenth)
 
         similarity_matrix = torch.matmul(query_image_block, key_image_block.transpose(-1, -2))
-        # print(similarity_matrix)
 
-        # print(f"similarity_matrix: {similarity_matrix.shape}")
-
-        _, top_index = (-similarity_matrix).topk(k=topK, dim=-1)  
-        # print(f"top_index: {top_index.shape}")
-        mask = torch.zeros(batch_size, query.shape[1], num_block, num_block).to(query_image.device)  
-        # print(f"mask: {mask.shape}")
+        _, top_index = (-similarity_matrix).topk(k=topK, dim=-1)
+        mask = torch.zeros(batch_size, query.shape[1], num_block, num_block).to(query_image.device)
         mask = mask.scatter_(3, top_index, float('-inf')) 
         # mask = mask.repeat_interleave(block_lenth, dim=2).repeat_interleave(block_lenth, dim=3)
         mask = mask.repeat_interleave(block_lenth, dim=2)
@@ -137,10 +132,8 @@ class SparseProcessAttnAigc(ScaledDotProductAttnAigc):
         mask = mask.unsqueeze(4).expand(mask_shape[0], mask_shape[1], mask_shape[2], mask_shape[3], block_lenth)
         mask = mask.reshape(mask_shape[0], mask_shape[1], mask_shape[2], mask_shape[3] * block_lenth)
 
-        # if encoder_hidden_states is not None:
         mask = torch.nn.functional.pad(mask, (N_text, 0, N_text, 0))
         mask = mask.to(torch.bool)
-        # print(f"final mask: {mask.shape}")
 
         # add by dkp.
         if return_attn_weights:
@@ -242,10 +235,8 @@ class SparseProcessAttnAigc_Local0408(ScaledDotProductAttnAigc):
         mask = mask.reshape(mask_shape[0], mask_shape[1], mask_shape[2], mask_shape[3] * block_lenth)
 
         ''' 5.还得把mask扩展一下 以匹配text token '''
-        # if encoder_hidden_states is not None:
         mask = torch.nn.functional.pad(mask, (N_text, 0, N_text, 0))
         mask = mask.to(torch.bool)
-        # print(f"final mask: {mask.shape}")
 
         # add by dkp.
         if return_attn_weights:

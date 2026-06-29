@@ -1,5 +1,3 @@
-import models.dit.nch.ldm.dump_config as dump_config
-
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -45,7 +43,6 @@ class FeedForwardSwiGlu(nn.Module):
     def forward(self, x):
         return self.down_proj((self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
-double_block_cnt = 0
 @maybe_allow_in_graph
 class NCHTransformerBlock(nn.Module):
     r"""
@@ -96,13 +93,11 @@ class NCHTransformerBlock(nn.Module):
             sr_ratio=sr_ratio,
         )
         if attn_type == 'default':
-            # print("******* attn_type:default **********")
             self.attn.sparse_attn = SparseProcessAttnAigc(
                 dim_head = attention_head_dim,
                 heads = num_attention_heads,
             )
         elif attn_type == 'local':
-            # print("******* attn_type:local **********")
             self.attn.sparse_attn = SparseProcessAttnAigc_Local0408(
                 dim_head = attention_head_dim,
                 heads = num_attention_heads,
@@ -178,15 +173,8 @@ class NCHTransformerBlock(nn.Module):
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
         
-        global double_block_cnt
-        if dump_config.DUMP_PER_BLOCK_RESULT_PATH is not None:
-            torch.save(encoder_hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_encoder_hidden_state_out.pt")
-            torch.save(hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_hidden_state_out.pt")
-            double_block_cnt = double_block_cnt + 1
-        
         return encoder_hidden_states, hidden_states
 
-cnt_forbbit = 0
 class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
     """
     The Transformer model introduced in NCH AIGC.
@@ -520,16 +508,6 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         # preprocessing
         bs, c, h, w = hidden_states.shape
 
-        global cnt_forbbit
-        if dump_config.DUMP_INIT_DATA_PATH is not None:
-            step = dump_config.DumpConfig.get_instance().current_step
-            print(f"[Dump Step {step}] dump golden input**************")
-            torch.save(hidden_states, dump_config.DUMP_INIT_DATA_PATH + '/' + dump_config.INPUT_SHAPE + f'_hidden_states_{cnt_forbbit}.pt')
-            torch.save(encoder_hidden_states, dump_config.DUMP_INIT_DATA_PATH + '/' + dump_config.INPUT_SHAPE + f'_encoder_hidden_states_{cnt_forbbit}.pt')
-            torch.save(timestep, dump_config.DUMP_INIT_DATA_PATH + '/' + dump_config.INPUT_SHAPE + f'_timestep_{cnt_forbbit}.pt')
-
-            cnt_forbbit = cnt_forbbit + 1
-
         image_rotary_emb = self.pos_embed([(1, item.shape[-2]//2, item.shape[-1]//2) for item in hidden_states], max_txt_seq_len=max(item.shape[0] for item in encoder_hidden_states), device=hidden_states.device)
         
         hidden_states = self.rearrange(hidden_states, bs, c, h, w, 2)
@@ -569,10 +547,6 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
 
         image_rotary_emb = self.convert_rope(image_rotary_emb, new_H, new_W, block_lenth_2D, new_img_len, hidden_states.dtype, hidden_states.device)
 
-        if dump_config.DUMP_PER_BLOCK_RESULT_PATH is not None:
-            torch.save(encoder_hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_encoder_hidden_state_in.pt")
-            torch.save(hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt}_hidden_state_in.pt")
-        
         # TACA: enable attention-slice extraction on selected blocks.
         extracting = extract_a_tex and self.taca is not None
         text_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
@@ -598,8 +572,6 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         features = []
         for index_block, block in enumerate(self.transformer_blocks):
             if index_block not in self.layers_to_retained[enable_skip_level]['transformer_blocks']:
-                
-                # print(self.layers_to_retained[enable_skip_level]['transformer_blocks'])
                 continue
             if torch.is_grad_enabled() and self.gradient_checkpointing:
 
@@ -665,9 +637,6 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        if dump_config.DUMP_PER_BLOCK_RESULT_PATH is not None:
-            torch.save(hidden_states, f"{dump_config.DUMP_PER_BLOCK_RESULT_PATH}/double_block{double_block_cnt-1}_hidden_state_out_concat.pt")
-
         ori_hidden_states = hidden_states[:, encoder_hidden_states.shape[1]:, ...]
 
         hidden_states = self.unreshape1D(ori_hidden_states, new_H, new_W, block_lenth_2D, new_img_len)
@@ -695,11 +664,6 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
 
         # postprocessing
         output = self.unrearrange(output, bs, c, h, w, 2)
-
-        if dump_config.DUMP_INIT_DATA_PATH is not None:
-            step = dump_config.DumpConfig.get_instance().current_step
-            print(f"[Dump Step {step}] dump golden output**************")
-            torch.save(output, dump_config.DUMP_INIT_DATA_PATH + '/' + dump_config.INPUT_SHAPE + f'_output_{cnt_forbbit-1}.pt')
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer

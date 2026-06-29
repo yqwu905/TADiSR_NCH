@@ -201,15 +201,6 @@ class TrainableVector_multitask():
             # 替换模型中的 embedding 层
             self.text_encoder.language_model.set_input_embeddings(new_embeddings)
             self.ori_embeds_params = self.text_encoder.language_model.get_input_embeddings().weight.data.clone()
-    
-            # # 在 add_new_token() 后添加验证
-            # print("原始词表大小：", original_vocab_size)
-            # print("Tokenizer 新增 Token 数量:", len(self.tokenizer) - original_vocab_size)
-            # print(f"自定义 Token 列表: {self.custom_tokens}, 长度：{len(self.custom_tokens)}")
-            # print("自定义 Token ID:", self.tokenizer.convert_tokens_to_ids(self.custom_tokens))
-            # embeddings = self.text_encoder.language_model.get_input_embeddings()
-            # print("嵌入层参数是否可训练:", embeddings.weight.requires_grad)
-            # print("新 Token 嵌入初始化值:", embeddings.weight[self.tokenizer.convert_tokens_to_ids(self.custom_tokens)].detach().float().cpu().numpy())
 
     def reset_old_token(self):
         if self.with_fix_token and self.token_requires_grad:

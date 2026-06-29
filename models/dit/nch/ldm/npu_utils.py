@@ -38,10 +38,3 @@ def fast_interleave_2d(tensor, block_length, dims=(2, 3)):
     for d in dims:
         tensor = fast_interleave(tensor, block_length, dim=d)
     return tensor
-
-if __name__ == "__main__":
-    import torch
-    x = torch.tensor([[1, 2],
-                  [3, 4]])
-
-    print(fast_interleave_2d(x, 2, (-1,-2)))

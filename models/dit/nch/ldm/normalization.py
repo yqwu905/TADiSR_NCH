@@ -15,7 +15,6 @@
 
 import numbers
 from typing import Dict, Optional, Tuple
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +22,6 @@ import torch.nn.functional as F
 from diffusers.utils import is_torch_npu_available, is_torch_version
 from diffusers.models.activations import get_activation
 from diffusers.models.embeddings import CombinedTimestepLabelEmbeddings
-from . import dump_config
 
 class AdaLayerNorm(nn.Module):
     r"""
@@ -94,7 +92,6 @@ class FP32LayerNorm(nn.LayerNorm):
         ).to(origin_dtype)
 
 
-offline_input_cnt = 0
 class AdaLayerNormZero(nn.Module):
     r"""
     Norm layer adaptive layer norm zero (adaLN-Zero).
@@ -135,22 +132,6 @@ class AdaLayerNormZero(nn.Module):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
         emb = self.linear(self.silu(emb))
-
-        if dump_config.DUMP_OFFLINE_INPUT_PATH is not None:
-            emb_numpy_array = emb.cpu()
-            global offline_input_cnt
-            step = dump_config.DumpConfig.get_instance().current_step
-            if offline_input_cnt % 2 == 0:
-                file_path = f"{dump_config.DUMP_OFFLINE_INPUT_PATH}/double_img_time_emb_{offline_input_cnt//2}.pt"
-                torch.save(emb_numpy_array, file_path)
-                print(f"[Dump Step {step}] saved double_img_time_emb_{offline_input_cnt//2}.pt")
-                offline_input_cnt = offline_input_cnt + 1
-            else:
-                emb_numpy_array = emb.cpu()
-                file_path = f"{dump_config.DUMP_OFFLINE_INPUT_PATH}/double_context_time_emb_{(offline_input_cnt-1)//2}.pt"
-                torch.save(emb_numpy_array, file_path)
-                print(f"[Dump Step {step}] saved double_context_time_emb_{(offline_input_cnt-1)//2}.pt")
-                offline_input_cnt = offline_input_cnt + 1
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
@@ -219,13 +200,6 @@ class AdaLayerNormContinuous(nn.Module):
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
         # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
         emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
-
-        if dump_config.DUMP_OFFLINE_INPUT_PATH is not None:
-            emb_numpy_array = emb.cpu()
-            step = dump_config.DumpConfig.get_instance().current_step
-            file_path = f"{dump_config.DUMP_OFFLINE_INPUT_PATH}/post_time_emb.pt"
-            torch.save(emb_numpy_array, file_path)
-            print(f"[Dump Step {step}] saved post_time_emb.pt")
 
         scale, shift = torch.chunk(emb, 2, dim=1)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]

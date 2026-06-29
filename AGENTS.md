@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本项目是一个模块化 PyTorch 训练框架。当前仓库只保留了框架代码和部分示例配置，具体的 `models/`、`network/`、`data/` 等业务实现已经移除；因此文档中的训练命令需要在补回对应模块、数据和 checkpoint 后才能完整运行。
+本项目是一个模块化 PyTorch 训练框架，用于复现 TADiSR（Text-Aware Real-World Image Super-Resolution, NeurIPS 2025）。框架代码在 `framework/`，业务实现（DiT、VAE、JSD 分割解码器、TACA 文本感知注意力、数据集、loss）分别在 `models/`、`data/`、`scripts/` 中。训练配置在 `configs/`。
 
 ## 项目结构
 
@@ -14,7 +14,10 @@
 - `framework/optim.py`: optimizer 和 scheduler 构建。
 - `framework/resolver.py`: context 输入解析器。支持 `ctx`、`const`、`ones_like`、`zeros_like`、`randn_like`、`detach`、`cast`、`getattr` 等输入 spec。
 - `framework/distributed.py`: CPU/CUDA/NPU 设备推断与 DDP 初始化。
-- `configs/`: 示例配置。当前部分引用了已删除的业务模块或未保留的外部配置，只能作为配置结构参考。
+- `configs/`: 训练配置。`tadisr_*.yaml` 为 TADiSR 训练配置，`test/` 为框架 smoke 测试配置，`model_config/`、`network_config/`、`data_config/` 为可复用配置片段。
+- `models/`: 业务模型实现。`dit/nch/ldm/` 为 NCH MMDiT transformer，`vae/npu/` 为 VAE 编解码器与 JSD 联合分割解码器，`text_encoder/` 为离线 embedding 与可训练 token，`loss/` 为 SR/分割 loss。
+- `data/`: 数据集实现。`tadisr_dataset.py` 提供 TADiSR 合成/真实数据集与 collate 函数。
+- `scripts/`: 辅助脚本。`generate_tadisr_data.py` 生成合成训练数据，`analyze_pangu_text_token.py` 分析 Pangu tokenizer 中关键词的 token 位置。
 
 ## 框架模型
 
@@ -214,14 +217,14 @@ uv run python -m framework.train \
 uv run tensorboard --logdir output
 ```
 
-注意：当前示例训练配置引用了已删除的业务实现，例如 `models.*`、`network.*`、`data.*`，并且部分 `imports` 指向未保留文件。补回这些模块和配置前，训练命令会在 import、配置加载或 checkpoint 路径处失败。
+注意：`configs/f16c64_vae_dit_proj_out_align.yaml` 和 `configs/f16c64_vae_x_embbder_align.yaml` 是早期框架调试配置，部分 import 目标可能不存在。TADiSR 训练使用 `configs/tadisr_*.yaml` 系列配置。
 
 ## 调试命令
 
 验证框架 Python 语法：
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q framework test_assets tests
+PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q framework test_assets tests models data scripts
 ```
 
 运行当前 smoke 测试：
@@ -390,7 +393,7 @@ python -m framework.train \
   data.train.dataloader.num_workers=0
 ```
 
-注意：示例训练配置引用了已删除的业务实现（`models.*`、`network.*`、`data.*`），补回这些模块前训练命令会在 import 或配置加载处失败。Colab 环境适合做框架层语法检查、配置解析验证、组件构建验证和 op/loss 注册检查。
+注意：TADiSR 训练使用 `configs/tadisr_*.yaml` 系列配置。上述早期框架调试配置仅供结构参考。Colab 环境也适合做框架层语法检查、配置解析验证、组件构建验证和 op/loss 注册检查。
 
 ### 注意事项
 
@@ -403,13 +406,20 @@ python -m framework.train \
 ## 当前已知状态
 
 - `README.md` 为空，`AGENTS.md` 是当前主要项目说明入口。
-- `framework/` 通过了语法级编译检查：
+- `framework/`、`models/`、`data/`、`scripts/` 均通过语法级编译检查：
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q framework
+PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q framework test_assets tests models data scripts
 ```
 
-- 示例配置中 `configs/f16c64_vae_dit_proj_out_align.yaml` 和 `configs/f16c64_vae_x_embbder_align.yaml` 的部分 import 目标不存在于当前仓库。
+- TADiSR 训练管线已完成 5 个阶段开发与 GPU 验证（详见 `TODO.md`）：
+  - 阶段 1：SR 基线管线（DiT + VAE + flow matching）
+  - 阶段 2：TACA 文本感知交叉注意力（chunked logsumexp 旁路提取）
+  - 阶段 3：JSD 联合分割解码器（双分支 + CDIB 交互）
+  - 阶段 4：完整 loss（TADiSRLoss + SegLoss）+ 联合训练配置
+  - 阶段 5：Colab GPU 验证（512/1024 分辨率，37 层 DiT）
+- `configs/tadisr_*.yaml` 系列配置可直接用于训练，需提供 DiT/VAE checkpoint、SQLite embedding 缓存和 FTSR 数据集路径。
+- `configs/f16c64_vae_dit_proj_out_align.yaml` 和 `configs/f16c64_vae_x_embbder_align.yaml` 是早期框架调试配置，部分 import 目标可能不存在。
 - `framework/ops/common.py` 的 `save_image` op 当前引用了未在文件中定义或导入的 `save_image`、`_ensure_list`、`_basename_without_ext`。使用该 op 前需要补齐实现或导入。
 
 ## Repository Map

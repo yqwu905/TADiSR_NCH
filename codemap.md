@@ -1,10 +1,8 @@
-# Repository Atlas: fictional-fortnight
+# Repository Atlas: TADiSR_NCH
 
 ## Project Responsibility
 
-A modular, configuration-driven PyTorch training framework (`futuretrainer`). The framework decouples model definition, data loading, loss computation, optimization, and distributed execution into independently configurable YAML-driven components. A user writes YAML configs specifying **what** to build (components), **what** to run (ops), **what** to optimize (losses), and **how** to parallelize (DDP/FSDP2); the framework handles instantiation, checkpointing, logging, phase execution, and distributed setup.
-
-The repository currently keeps only the framework code and example/smoke-test configs. Business modules (`models/`, `network/`, `data/`) have been removed, so the example training configs serve as structural references and cannot run end-to-end without restoring those modules. The `configs/test/` smoke-test configs use `test_assets/` stand-in modules and **do** run.
+A modular, configuration-driven PyTorch training framework (`futuretrainer`) used to reproduce TADiSR (Text-Aware Real-World Image Super-Resolution, NeurIPS 2025). The framework decouples model definition, data loading, loss computation, optimization, and distributed execution into independently configurable YAML-driven components. Business modules implementing the TADiSR pipeline — NCH MMDiT DiT transformer (`models/dit/`), VAE encoder/decoder + JSD joint segmentation decoder (`models/vae/`), offline text embedding + trainable tokens (`models/text_encoder/`), TADiSR dataset (`data/`), SR/segmentation losses (`models/loss/`), and data generation/analysis scripts (`scripts/`) — are all present in the repository. Training configs in `configs/tadisr_*.yaml` are ready for training given appropriate checkpoints, embedding cache, and dataset paths. The `configs/test/` smoke-test configs use `test_assets/` stand-in modules and also run.
 
 ## System Entry Points
 
@@ -45,6 +43,9 @@ Control flow: `train.py` -> `load_config` -> `Trainer.__init__` (distributed + c
 
 - `tests/` — smoke tests (`test_smoke_training.py`); documented as a consumer in `configs/test/codemap.md`.
 - `test_assets/` — stand-in components (`TinyRegressor`, `LinearRegressionDataset`, `RegressionMSELoss`) used by smoke tests; documented as a dependency in `configs/test/codemap.md`.
+- `models/` — TADiSR business modules (DiT, VAE, JSD, text encoder, loss); structured by domain, not separately mapped.
+- `data/` — TADiSR dataset implementation (`tadisr_dataset.py`); single-file module.
+- `scripts/` — auxiliary scripts (`generate_tadisr_data.py`, `analyze_pangu_text_token.py`); standalone entry points.
 - `.venv/`, `.ruff_cache/`, `.codegraph/`, `output/` — environment, caches, build artifacts (gitignored or local-only).
 
 ## Cross-Reference: How Modules Connect
@@ -80,9 +81,11 @@ framework/utils.py             StepTimer: context-manager profiler with distribu
 
 ## Known State
 
-- `framework/` passes syntax-level compile (`python3 -m compileall -q framework`).
+- `framework/`, `models/`, `data/`, `scripts/` all pass syntax-level compile (`python3 -m compileall -q framework test_assets tests models data scripts`).
+- TADiSR training pipeline is complete through 5 stages (see `TODO.md`): SR baseline, TACA text-aware attention, JSD joint segmentation decoder, full loss + joint training config, and Colab GPU verification (512/1024 resolution, 37-layer DiT).
+- `configs/tadisr_*.yaml` configs are ready for training; they require DiT/VAE checkpoints, a SQLite embedding cache, and FTSR dataset paths.
 - `framework/ops/common.py` `save_image` op is **broken**: references undefined `save_image`, `_ensure_list`, `_basename_without_ext`. See [framework/ops/codemap.md](framework/ops/codemap.md).
-- Example configs (`configs/f16c64_vae_dit_proj_out_align.yaml`, `configs/f16c64_vae_x_embbder_align.yaml`) reference removed business modules (`models.*`, `network.*`, `data.*`) and cannot run without restoring them.
+- `configs/f16c64_vae_dit_proj_out_align.yaml` and `configs/f16c64_vae_x_embbder_align.yaml` are early framework debug configs with potentially missing import targets; use `configs/tadisr_*.yaml` for actual training.
 - `configs/test/` smoke configs run via `python3 -m unittest discover -s tests -v` (FSDP2 tests gated by `RUN_FSDP2_TORCHRUN_SMOKE=1`).
 
 ## Quick Commands
@@ -92,7 +95,7 @@ framework/utils.py             StepTimer: context-manager profiler with distribu
 uv sync
 
 # Framework syntax check
-PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q framework test_assets tests
+PYTHONPYCACHEPREFIX=/tmp/fictional-fortnight-pycache python3 -m compileall -q framework test_assets tests models data scripts
 
 # Smoke tests
 python3 -m unittest discover -s tests -v
