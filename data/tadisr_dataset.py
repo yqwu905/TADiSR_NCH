@@ -10,11 +10,16 @@ inference stack into the DataLoader workers.
 When real FTSR data is unavailable, set `data_root=None` (or point it at a
 non-existent path) to use a synthetic random-data mode that produces valid
 shapes for pipeline smoke testing.
+
+``target_size`` accepts either an int (square ``HxH``) or a string
+``"HxW"`` (e.g. ``"768x1024"``). Both HR and LR are resized to this
+spatial size so the VAE encoder produces a consistent latent grid
+regardless of the source PNG dimensions.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -29,15 +34,40 @@ from torch.utils.data import Dataset
 DEFAULT_PROMPT = "A high-quality photo with clear text"
 
 
+def _parse_target_size(target_size: Union[int, str, Tuple[int, int]]) -> Tuple[int, int]:
+    if isinstance(target_size, (tuple, list)) and len(target_size) == 2:
+        h, w = int(target_size[0]), int(target_size[1])
+    elif isinstance(target_size, int):
+        h = w = target_size
+    elif isinstance(target_size, str):
+        parts = target_size.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError(
+                f"target_size must be 'HxW' (e.g. '768x1024'), got {target_size!r}"
+            )
+        h, w = int(parts[0]), int(parts[1])
+    else:
+        raise TypeError(
+            f"target_size must be int, str 'HxW', or (H,W) tuple, got "
+            f"{type(target_size).__name__}"
+        )
+    if h <= 0 or w <= 0:
+        raise ValueError(f"target_size must be positive, got ({h}, {w})")
+    return h, w
+
+
 class TADiSRDataset(Dataset):
     """
     Dataset for FTSR triplets: (x_L, x_H, s) plus a fixed text prompt.
 
     Each sample provides:
-      - lr:     [3, H_lr, W_lr]   low-resolution image, float32, [0,1]
-      - hr:     [3, H_hr, W_hr]   high-resolution image, float32, [0,1]
-      - mask:   [1, H_hr, W_hr]   text segmentation mask, float32, [0,1]
-      - prompt: str               fixed text prompt for EmbeddingDB lookup
+      - lr:     [3, H, W]   low-resolution image, float32, [0,1]
+      - hr:     [3, H, W]   high-resolution image, float32, [0,1]
+      - mask:   [1, H, W]   text segmentation mask, float32, [0,1]
+      - prompt: str         fixed text prompt for EmbeddingDB lookup
+
+    All spatial dims are resized to ``target_size`` so downstream VAE/DiT
+    latent grids are consistent.
 
     Directory layout expected (when data_root points to real FTSR data):
         {data_root}/HR/{name}.png
@@ -50,14 +80,12 @@ class TADiSRDataset(Dataset):
         data_root: Optional[str] = None,
         lr_path: str = "LR",
         prompt: str = DEFAULT_PROMPT,
-        hr_size: int = 512,
-        lr_size: Optional[int] = None,
+        target_size: Union[int, str, Tuple[int, int]] = 512,
         length: int = 64,
         seed: int = 42,
     ):
         self.prompt = prompt
-        self.hr_size = hr_size
-        self.lr_size = lr_size if lr_size is not None else hr_size // 4
+        self.target_h, self.target_w = _parse_target_size(target_size)
         self._mode = "real"
 
         if data_root is not None:
@@ -85,7 +113,7 @@ class TADiSRDataset(Dataset):
             self._gen = torch.Generator().manual_seed(int(seed))
             print(
                 f"[TADiSRDataset] synthetic mode: {self.length} samples, "
-                f"hr={self.hr_size}, lr={self.lr_size}"
+                f"target=({self.target_h}, {self.target_w})"
             )
         else:
             self.length = len(self.samples)
@@ -95,16 +123,19 @@ class TADiSRDataset(Dataset):
         return self.length
 
     def _synthetic_sample(self) -> dict:
-        hr = torch.rand(3, self.hr_size, self.hr_size, generator=self._gen)
-        # LR is generated at lr_size then upsampled to hr_size so the VAE
-        # encoder produces an HR-resolution latent (the DiT operates at HR
-        # latent resolution; the degradation is encoded in the pixel content).
-        lr_small = torch.rand(3, self.lr_size, self.lr_size, generator=self._gen)
+        H, W = self.target_h, self.target_w
+        hr = torch.rand(3, H, W, generator=self._gen)
+        # LR is generated at 1/4 resolution then upsampled to target so the
+        # VAE encoder produces a target-resolution latent (the DiT operates
+        # at that latent resolution; the degradation is encoded in the
+        # pixel content).
+        lr_h, lr_w = max(H // 4, 1), max(W // 4, 1)
+        lr_small = torch.rand(3, lr_h, lr_w, generator=self._gen)
         lr = torch.nn.functional.interpolate(
-            lr_small.unsqueeze(0), size=(self.hr_size, self.hr_size),
+            lr_small.unsqueeze(0), size=(H, W),
             mode="bilinear", align_corners=False,
         ).squeeze(0)
-        mask = (torch.rand(1, self.hr_size, self.hr_size, generator=self._gen) > 0.7).float()
+        mask = (torch.rand(1, H, W, generator=self._gen) > 0.7).float()
         return {"lr": lr, "hr": hr, "mask": mask, "prompt": self.prompt}
 
     def _real_sample(self, idx: int) -> dict:
@@ -130,6 +161,20 @@ class TADiSRDataset(Dataset):
         lr_tensor = torch.from_numpy(lr_img.transpose(2, 0, 1)).float() / 255.0
         mask_tensor = torch.from_numpy(mask_img).unsqueeze(0).float() / 255.0
 
+        size = (self.target_h, self.target_w)
+        hr_tensor = torch.nn.functional.interpolate(
+            hr_tensor.unsqueeze(0), size=size,
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+        lr_tensor = torch.nn.functional.interpolate(
+            lr_tensor.unsqueeze(0), size=size,
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+        mask_tensor = torch.nn.functional.interpolate(
+            mask_tensor.unsqueeze(0), size=size,
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+
         return {
             "lr": lr_tensor,
             "hr": hr_tensor,
@@ -138,10 +183,11 @@ class TADiSRDataset(Dataset):
         }
 
     def _empty_sample(self, filename: str) -> dict:
+        H, W = self.target_h, self.target_w
         return {
-            "lr": torch.zeros(3, self.lr_size, self.lr_size),
-            "hr": torch.zeros(3, self.hr_size, self.hr_size),
-            "mask": torch.zeros(1, self.hr_size, self.hr_size),
+            "lr": torch.zeros(3, H, W),
+            "hr": torch.zeros(3, H, W),
+            "mask": torch.zeros(1, H, W),
             "prompt": self.prompt,
         }
 

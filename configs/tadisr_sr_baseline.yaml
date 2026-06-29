@@ -33,8 +33,7 @@ data:
       target: data.tadisr_dataset.TADiSRDataset
       params:
         data_root: null              # null => synthetic random data for smoke
-        hr_size: 512
-        lr_size: 128                 # 4x downsampling
+        target_size: "512x512"     # HR and LR both resized to HxW
         length: 4
         seed: 42
     dataloader:

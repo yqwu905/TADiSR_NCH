@@ -49,8 +49,7 @@ data:
       target: data.tadisr_dataset.TADiSRDataset
       params:
         data_root: /content/tadisr_dataset
-        hr_size: 1024
-        lr_size: 256            # 4x downsampling
+        target_size: "1024x1024"   # HR and LR both resized to HxW
         length: 1000
         seed: 42
     dataloader:
