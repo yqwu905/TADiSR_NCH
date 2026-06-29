@@ -252,8 +252,8 @@ train_program:
         make_taca_heatmap:
           type: make_heatmap
           input: pred.a_tex
-          grid_h: 32                  # 1024 px / VAE downscale-32 = 32 latent grid
-          grid_w: 32
+          grid_source: lq.latent      # infer token grid from VAE latent H,W
+          patchify: 2                 # DiT internal patchify=2 -> grid = H/2 x W/2
           target_h: 1024
           target_w: 1024
           reduce: norm

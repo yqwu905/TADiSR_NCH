@@ -144,12 +144,22 @@ class MakeHeatmapOp:
     tensor back to context. That tensor can then be picked up by the
     framework's image logger (``logging.images.items[]``) for TensorBoard.
 
+    The token grid is inferred from a 4D latent tensor in context
+    (``grid_source``) divided by ``patchify``. This supports non-square
+    inputs, e.g. a real FTSR PNG whose VAE latent is ``[B, C, H, W]`` with
+    ``H != W``; the DiT internally patchifies by 2, so the resulting token
+    grid is ``[H // patchify, W // patchify]`` and ``S_img`` must equal
+    their product.
+
     Config keys:
         input       : ctx key pointing to the source tensor ([B, S, C] or
                       any tensor whose trailing dim holds the feature axis)
-        grid_h      : optional int, patch grid height (auto-inferred when
-                      omitted via sqrt(S))
-        grid_w      : optional int, patch grid width (auto-inferred)
+        grid_source : ctx key pointing to a 4D tensor ([B, C, H, W]) whose
+                      spatial dims are divided by ``patchify`` to obtain
+                      the token grid
+        patchify    : int, spatial downscale from ``grid_source`` to the
+                      token grid (default 2, matching the DiT internal
+                      patchify)
         target_h    : optional int, interpolate to this height (default grid_h)
         target_w    : optional int, interpolate to this width  (default grid_w)
         reduce      : "norm" (default) or "mean" along the feature axis
@@ -168,11 +178,30 @@ class MakeHeatmapOp:
             )
 
         reduce_mode = str(self.cfg.get("reduce", "norm")).lower()
-        grid_h = self.cfg.get("grid_h")
-        grid_w = self.cfg.get("grid_w")
-        target_h = self.cfg.get("target_h", grid_h)
-        target_w = self.cfg.get("target_w", grid_w)
+        patchify = int(self.cfg.get("patchify", 2))
         normalize = bool(self.cfg.get("normalize", True))
+
+        grid_source_key = self.cfg.get("grid_source")
+        if grid_source_key is None:
+            raise ValueError(
+                "make_heatmap requires 'grid_source' pointing to a 4D "
+                "latent tensor in context"
+            )
+        grid_source = resolve_input(grid_source_key, ctx)
+        if not torch.is_tensor(grid_source) or grid_source.ndim != 4:
+            raise TypeError(
+                f"make_heatmap 'grid_source' must be a 4D tensor, got "
+                f"{type(grid_source).__name__} with ndim="
+                f"{getattr(grid_source, 'ndim', None)}"
+            )
+
+        src_h, src_w = int(grid_source.shape[-2]), int(grid_source.shape[-1])
+        if src_h % patchify != 0 or src_w % patchify != 0:
+            raise ValueError(
+                f"make_heatmap grid_source spatial dims ({src_h}, {src_w}) "
+                f"must be divisible by patchify={patchify}"
+            )
+        grid_h, grid_w = src_h // patchify, src_w // patchify
 
         x = value.detach()
 
@@ -186,22 +215,21 @@ class MakeHeatmapOp:
         if heat.ndim == 1:
             heat = heat.unsqueeze(0)
 
-        if grid_h is None or grid_w is None:
-            s = int(heat.shape[-1])
-            side = int(round(s ** 0.5))
-            if side * side != s:
-                raise ValueError(
-                    f"make_heatmap cannot auto-infer grid for S={s}; "
-                    f"please pass grid_h/grid_w explicitly"
-                )
-            grid_h = grid_h or side
-            grid_w = grid_w or side
+        s = int(heat.shape[-1])
+        if s != grid_h * grid_w:
+            raise ValueError(
+                f"make_heatmap token count S={s} does not match "
+                f"grid_h*grid_w={grid_h}*{grid_w}={grid_h * grid_w} "
+                f"(grid_source=({src_h},{src_w}), patchify={patchify})"
+            )
 
-        heat = heat.reshape(heat.shape[0], 1, int(grid_h), int(grid_w))
+        heat = heat.reshape(heat.shape[0], 1, grid_h, grid_w)
 
-        th = int(target_h) if target_h is not None else int(grid_h)
-        tw = int(target_w) if target_w is not None else int(grid_w)
-        if (th, tw) != (int(grid_h), int(grid_w)):
+        target_h = self.cfg.get("target_h", grid_h)
+        target_w = self.cfg.get("target_w", grid_w)
+        th = int(target_h) if target_h is not None else grid_h
+        tw = int(target_w) if target_w is not None else grid_w
+        if (th, tw) != (grid_h, grid_w):
             heat = torch.nn.functional.interpolate(
                 heat, size=(th, tw), mode="bilinear", align_corners=False
             )
