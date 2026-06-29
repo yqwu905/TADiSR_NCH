@@ -285,6 +285,7 @@ profiling:
   enabled: false
 
 checkpoint:
-  save_every_steps: 100
-  save_optimizer: true
-  save_scheduler: true
+  save_every_steps: 200
+  keep_last: 1                 # only keep the most recent step-ckpt on disk
+  save_optimizer: false        # opt state doubles size; skip on Colab /content disk
+  save_scheduler: false
