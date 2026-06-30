@@ -1,0 +1,94 @@
+# TADiSR full F8C32 config for single-GPU 1024px training.
+#
+# Inherits the F8C32 geometry from configs/tadisr_full_f8c32.yaml and
+# expands the DiT to the 37-layer training shape.
+
+include: configs/tadisr_full_f8c32.yaml
+
+experiment:
+  name: tadisr_full_37l_1024_f8c32
+  output_dir: output/tadisr_full_37l_1024_f8c32
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  gradient_accumulation_steps: 1
+  distributed:
+    strategy: none
+
+train:
+  max_steps: 1000
+  max_epochs: 1
+  log_every: 20
+
+data:
+  train:
+    dataset:
+      params:
+        data_root: /content/tadisr_dataset
+        target_size: "1024x1024"
+        length: 1000
+    dataloader:
+      batch_size: 1
+      shuffle: true
+      num_workers: 2
+      drop_last: false
+
+components:
+  vae_encoder:
+    params:
+      ddconfig:
+        resolution: 1024
+
+  dit:
+    params:
+      num_layers: 37
+      topK: [0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
+             0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
+             0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
+             0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
+             0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
+             0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
+             0.8333]
+      layers_to_retained:
+        "100":
+          transformer_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                               10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                               20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                               30, 31, 32, 33, 34, 35, 36]
+      taca_cfg:
+        enabled: true
+        taca_layers: [4, 9, 14, 19, 24, 29, 34]
+        text_token_indices: [8]
+        query_chunk_size: 1024
+        use_checkpoint: true
+        out_dim: 32
+    gradient_checkpointing: true
+
+  jsd:
+    params:
+      resolution: 1024
+    gradient_checkpointing: true
+
+logging:
+  reduce_metrics: true
+  backends:
+    tensorboard:
+      enabled: true
+      log_dir: null
+  images:
+    enabled: true
+    every_n_steps: 100
+    max_images: 1
+    items:
+      - { tag: lq,       key: batch.lr,   value_range: "0_1",  max_images: 1 }
+      - { tag: gt,       key: batch.hr,   value_range: "0_1",  max_images: 1 }
+      - { tag: gt_mask,  key: batch.mask, value_range: "0_1",  max_images: 1 }
+      - { tag: pred_rgb, key: pred.rgb,   value_range: "-1_1", max_images: 1 }
+      - { tag: pred_seg, key: pred.seg,   value_range: "0_1",  max_images: 1 }
+
+checkpoint:
+  save_every_steps: 200
+  keep_last: 1
+  save_optimizer: false
+  save_scheduler: false
