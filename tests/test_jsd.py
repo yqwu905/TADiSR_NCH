@@ -7,6 +7,7 @@ Covers:
 - CDIB shape preservation and cross-branch interaction.
 - JointSegDecoder output shapes (recon RGB + seg mask), seg range [0,1],
   a_tex seq->spatial reshape, and gradient flow to both branches.
+- F8C32 VAE wrapper and JSD decoder-target compatibility.
 - jsd_decode op glue: reads context, calls component, writes outputs.
 """
 from __future__ import annotations
@@ -18,6 +19,8 @@ import torch.nn as nn
 
 from framework.context import TrainContext
 from framework.ops.diffusion import JSDDecodeOp
+from models.vae.npu.f8c32_swin import VaeDecoder as F8C32Decoder
+from models.vae.npu.f8c32_swin import VaeEncoder as F8C32Encoder
 from models.vae.npu.jsd import CDIB, JointSegDecoder
 
 
@@ -107,6 +110,35 @@ class JointSegDecoderTest(unittest.TestCase):
         jsd = self._make(resolution=128)
         self.assertEqual(jsd.cdib_levels, [4, 3, 2, 1])
 
+    def test_f8c32_decoder_layout(self):
+        torch.manual_seed(2)
+        jsd = JointSegDecoder(
+            z_channels=32,
+            a_tex_channels=32,
+            resolution=64,
+            ch=32,
+            ch_mult=[1, 2, 4, 4],
+            num_res_blocks=[1, 1, 1, 1],
+            decoder_target="models.vae.npu.f8c32_swin.Decoder",
+            decoder_activation="swish",
+            image_post_quant_conv=True,
+            image_embed_dim=32,
+            image_latent_shift_factor=0.07050679,
+            image_latent_scaling_factor=0.2517327,
+            image_output_scale=1.0,
+            image_output_shift=0.0,
+            cdib_levels=[3, 2, 1],
+            swin_depths=[1],
+            swin_num_heads=[4],
+            swin_window_size=4,
+        )
+        latent = torch.randn(1, 32, 8, 8)
+        a_tex = torch.randn(1, 16, 32)
+        out = jsd(latent, a_tex)
+        self.assertEqual(out["recon"].shape, (1, 3, 64, 64))
+        self.assertEqual(out["seg"].shape, (1, 1, 64, 64))
+        self.assertEqual(jsd.cdib_levels, [3, 2, 1])
+
     def test_image_branch_identity_without_cdib(self):
         # With CDIB at no levels, image branch == plain VAE decode path.
         from models.vae.npu.f16c64 import SHIFTING_FACTOR, SCALING_FACTOR
@@ -163,6 +195,39 @@ class JSDDecodeOpTest(unittest.TestCase):
         ctx.set("x", torch.randn(1, 64, 8, 8))
         with self.assertRaises(KeyError):
             op(ctx, {"jsd": nn.Identity()})
+
+
+class F8C32VaeWrapperTest(unittest.TestCase):
+    def _params(self):
+        return {
+            "embed_dim": 32,
+            "ddconfig": {
+                "double_z": True,
+                "z_channels": 32,
+                "resolution": 64,
+                "in_channels": 3,
+                "out_ch": 3,
+                "ch": 32,
+                "ch_mult": [1, 2, 4, 4],
+                "num_res_blocks": [1, 1, 1, 1],
+                "attn_resolutions": [],
+                "dropout": 0.0,
+                "swin_depths": [1],
+                "swin_num_heads": [4],
+                "swin_window_size": 4,
+            },
+        }
+
+    def test_encoder_decoder_shapes(self):
+        torch.manual_seed(3)
+        params = self._params()
+        encoder = F8C32Encoder(**params)
+        decoder = F8C32Decoder(**params)
+        x = torch.randn(1, 3, 64, 64)
+        latent = encoder(x)["latent"]
+        self.assertEqual(latent.shape, (1, 32, 8, 8))
+        recon = decoder(latent)["recon"]
+        self.assertEqual(recon.shape, (1, 3, 64, 64))
 
 
 if __name__ == "__main__":

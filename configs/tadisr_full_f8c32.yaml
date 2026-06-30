@@ -1,0 +1,261 @@
+# TADiSR full training config adapted for the F8C32 Swin VAE.
+#
+# Geometry:
+#   VAE latent:      C=32, downsample factor=8
+#   DiT model input: concat [x_start, mask(2x), lq] => 32*(1+2+1)=128ch
+#   DiT x_embedder:  internal 2x2 patchify => 128*4=512 input dim
+#   DiT output:      128 patch channels unrearranged back to 32 latent channels
+#   TACA/JSD:        a_tex out_dim = a_tex_channels = 32
+
+experiment:
+  name: tadisr_full_f8c32
+  output_dir: output/tadisr_full_f8c32
+
+runtime:
+  device: cpu
+  mixed_precision: "no"
+  gradient_accumulation_steps: 1
+  distributed:
+    strategy: none
+
+train:
+  max_steps: 2
+  max_epochs: 1
+  log_every: 1
+
+data:
+  train:
+    dataset:
+      target: data.tadisr_dataset.TADiSRDataset
+      params:
+        data_root: null
+        target_size: "256x256"
+        length: 4
+        seed: 42
+    dataloader:
+      batch_size: 1
+      shuffle: true
+      num_workers: 0
+      drop_last: false
+      collate_fn:
+        target: data.tadisr_dataset.TADiSRCollateFn
+
+components:
+  vae_encoder:
+    target: models.vae.npu.f8c32_swin.VaeEncoder
+    params:
+      embed_dim: 32
+      shift_factor: 0.07050679
+      scaling_factor: 0.2517327
+      ddconfig:
+        double_z: true
+        z_channels: 32
+        resolution: 256
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult: [1, 2, 4, 4]
+        num_res_blocks: [2, 3, 2, 2]
+        attn_resolutions: []
+        dropout: 0.0
+    strict: false
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+
+  offline_embedding:
+    target: models.text_encoder.offline_embedding.EmbeddingDB
+    params:
+      embedding_cache_path: embedding_pangu_1b_vl.sqlite
+      task_tokens: dehalo
+      trainable_vector_cfg:
+        target: models.text_encoder.nch.utils_nch.TrainableVector_multitask
+        params:
+          dehalo_fix_tokens: true
+          token_requires_grad: true
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+
+  dit:
+    target: models.dit.nch.ldm.transformer_nch_v3_split.NCHTransformer2DModel
+    params:
+      patch_size: 1
+      in_channels: 512
+      out_channels: 128
+      num_layers: 4
+      attention_head_dim: 384
+      num_attention_heads: 4
+      joint_attention_dim: 1536
+      pooled_projection_dim: 768
+      guidance_embeds: false
+      axes_dims_rope: [48, 168, 168]
+      processor_type: default
+      ffn_ratio: 4
+      adaln_dim: 1536
+      block_lenth: 64
+      topK: [0.8333, 0.8333, 0.8333, 0.8333]
+      layers_to_retained:
+        "100":
+          transformer_blocks: [0, 1, 2, 3]
+      taca_cfg:
+        enabled: true
+        taca_layers: [1, 2, 3]
+        text_token_indices: [8]
+        query_chunk_size: 1024
+        use_checkpoint: false
+        out_dim: 32
+    strict: false
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+  jsd:
+    target: models.vae.npu.jsd.JointSegDecoder
+    params:
+      z_channels: 32
+      a_tex_channels: 32
+      resolution: 256
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: [2, 3, 2, 2]
+      in_channels: 3
+      seg_channels: 1
+      decoder_target: models.vae.npu.f8c32_swin.Decoder
+      decoder_activation: swish
+      image_post_quant_conv: true
+      image_embed_dim: 32
+      image_latent_shift_factor: 0.07050679
+      image_latent_scaling_factor: 0.2517327
+      image_output_scale: 1.0
+      image_output_shift: 0.0
+      cdib_levels: [3, 2, 1]
+    train:
+      strategy: full
+    mode: train
+    save: full
+
+optimizers:
+  dit_optim:
+    type: adamw
+    lr: 5.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - dit
+  jsd_optim:
+    type: adamw
+    lr: 5.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - jsd
+
+losses:
+  sr:
+    target: models.loss.tadisr_loss.TADiSRLoss
+    params:
+      w_l2: 1.0
+      w_lpips: 0.0
+      w_mf: 10.0
+      focal_gamma: 2.0
+    inputs:
+      pred: pred.rgb
+      target: batch.hr_norm
+      pred_seg: pred.seg
+      target_seg: batch.mask
+    weight: 1.0
+  seg:
+    target: models.loss.seg_loss.SegLoss
+    params:
+      w_l2: 1.0
+      w_focal: 10.0
+      w_dice: 1.0
+      focal_gamma: 2.0
+      focal_alpha: 0.25
+    inputs:
+      pred: pred.seg
+      target: batch.mask
+    weight: 1.0
+
+train_program:
+  phases:
+    - name: generator
+      trainable: [dit, jsd]
+      zero_grad: [dit_optim, jsd_optim]
+      backward: true
+      step: [dit_optim, jsd_optim]
+      ops:
+        vae_encode:
+          component: vae_encoder
+          inputs:
+            x: batch.lr
+          outputs:
+            latent: lq.latent
+        text_encode:
+          component: offline_embedding
+          method: get_embedding
+          inputs:
+            text: batch.prompt
+            model_id:
+              type: const
+              value: pangu_1b_vl
+          outputs:
+            encoder_hidden_states: encoder_hidden_states
+        dit_sr:
+          type: nch_mmdit_sr
+          component: dit
+          input_type: lq
+          timestep: 1.0
+          mask_repeat: 2
+          enable_skip_level: "100"
+          denoise: true
+          extract_a_tex: true
+          inputs:
+            latent: lq.latent
+            encoder_hidden_states: encoder_hidden_states
+          outputs:
+            latent_denoised: pred.latent_denoised
+            a_tex: pred.a_tex
+        jsd_decode:
+          type: jsd_decode
+          component: jsd
+          inputs:
+            latent: pred.latent_denoised
+            a_tex: pred.a_tex
+          outputs:
+            recon: pred.rgb
+            seg: pred.seg
+        rescale_hr:
+          type: rescale
+          input: batch.hr
+          scale: 2.0
+          shift: -1.0
+          output: batch.hr_norm
+      losses:
+        - sr
+        - seg
+
+logging:
+  reduce_metrics: true
+  backends:
+    tensorboard:
+      enabled: false
+      log_dir: null
+    aim:
+      enabled: false
+    wandb:
+      enabled: false
+  images:
+    enabled: false
+
+profiling:
+  enabled: false
+
+checkpoint:
+  save_every_steps: 0
+  save_optimizer: true
+  save_scheduler: true
