@@ -1,9 +1,38 @@
-# TADiSR full F8C32 config for single-GPU 1024px training.
+# TADiSR full training config for Colab GPU (PRO 6000 Blackwell ~96GB).
+# 37-layer sparse-attention NCH MMDiT @ 1024 resolution with DiT gradient
+# checkpointing, runs on a single GPU (distributed=none, mixed_precision=bf16).
 #
-# Inherits the F8C32 geometry from configs/tadisr_full_f8c32.yaml and
-# expands the DiT to the 37-layer training shape.
-
-include: configs/tadisr_full_f8c32.yaml
+# F8C32 adaptation:
+#   VAE latent: C=32, downsample factor=8
+#   DiT model input: concat [x_start, mask(2x), lq] => 32*(1+2+1)=128ch
+#   DiT x_embedder: internal 2x2 patchify => 128*4=512 input dim
+#   DiT output: 128 patch channels unrearranged back to 32 latent channels
+#   TACA/JSD: a_tex out_dim = a_tex_channels = 32
+#
+# Pipeline (single phase):
+#   vae_encode(batch.lr)                          -> lq.latent
+#   text_encode(batch.prompt)                     -> encoder_hidden_states
+#   dit_sr(..., extract_a_tex=true)               -> pred.latent_denoised + pred.a_tex
+#   jsd_decode(...)                               -> pred.rgb + pred.seg
+#   rescale_hr(batch.hr, 2*x-1)                   -> batch.hr_norm   # [0,1]->[-1,1]
+#   make_heatmap(pred.a_tex)                      -> pred.taca_heatmap
+#   sr_loss(pred.rgb, batch.hr_norm, pred.seg, batch.mask)
+#   seg_loss(pred.seg, batch.mask)
+#
+# Real dataset (pre-generated HR/LR/Mask PNG triplets under /content/tadisr_dataset)
+# is consumed in real mode by data.tadisr_dataset.TADiSRDataset. Generate it
+# first with:
+#     python scripts/generate_tadisr_data.py \
+#         --output-dir /content/tadisr_dataset --num-images 1000 \
+#         --hr-size 1024 --lr-size 256 --seed 42
+#
+# Checkpoints are written every 100 steps so a Colab session disconnect
+# does not lose more than ~5 minutes of progress.
+#
+# Run on Colab (single GPU):
+#     python -m framework.train \
+#         --config configs/tadisr_full_37l_1024_f8c32.yaml \
+#         runtime.distributed.strategy=none
 
 experiment:
   name: tadisr_full_37l_1024_f8c32
@@ -24,25 +53,81 @@ train:
 data:
   train:
     dataset:
+      target: data.tadisr_dataset.TADiSRDataset
       params:
         data_root: /content/tadisr_dataset
-        target_size: "1024x1024"
+        target_size: "1024x1024"   # HR and LR both resized to HxW
         length: 1000
+        seed: 42
     dataloader:
       batch_size: 1
       shuffle: true
       num_workers: 2
       drop_last: false
+      collate_fn:
+        target: data.tadisr_dataset.TADiSRCollateFn
 
 components:
   vae_encoder:
+    target: models.vae.npu.f8c32_swin.VaeEncoder
     params:
+      embed_dim: 32
+      shift_factor: 0.07050679
+      scaling_factor: 0.2517327
       ddconfig:
+        double_z: true
+        z_channels: 32
         resolution: 1024
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult: [1, 2, 4, 4]
+        num_res_blocks: [2, 3, 2, 2]
+        attn_resolutions: []
+        dropout: 0.0
+    strict: false
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
+
+  offline_embedding:
+    target: models.text_encoder.offline_embedding.EmbeddingDB
+    params:
+      embedding_cache_path: embedding_pangu_1b_vl.sqlite
+      task_tokens: dehalo
+      trainable_vector_cfg:
+        target: models.text_encoder.nch.utils_nch.TrainableVector_multitask
+        params:
+          dehalo_fix_tokens: true
+          token_requires_grad: true
+    train:
+      strategy: frozen
+    mode: eval
+    save: none
 
   dit:
+    target: models.dit.nch.ldm.transformer_nch_v3_split.NCHTransformer2DModel
     params:
+      patch_size: 1
+      in_channels: 512
+      out_channels: 128
       num_layers: 37
+      attention_head_dim: 384
+      num_attention_heads: 4
+      joint_attention_dim: 1536
+      pooled_projection_dim: 768
+      guidance_embeds: false
+      axes_dims_rope: [48, 168, 168]
+      processor_type: default       # default processor supports TACA extract
+                                   # (chunked-logsumexp side path). SparseAttnProcessor
+                                   # does not implement taca_slice harvesting; using
+                                   # sparse would silently yield a_tex=None and break
+                                   # the make_heatmap op. SDPA on 1024 latent (S=4096)
+                                   # is fine in ~95GB VRAM.
+      ffn_ratio: 4
+      adaln_dim: 1536
+      block_lenth: 64
       topK: [0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
              0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
              0.8333, 0.8333, 0.8333, 0.8333, 0.8333, 0.8333,
@@ -58,37 +143,178 @@ components:
                                30, 31, 32, 33, 34, 35, 36]
       taca_cfg:
         enabled: true
-        taca_layers: [4, 9, 14, 19, 24, 29, 34]
+        taca_layers: [4, 9, 14, 19, 24, 29, 34]   # 7 sparsely spaced layers
         text_token_indices: [8]
         query_chunk_size: 1024
-        use_checkpoint: true
+        use_checkpoint: true                       # save memory under 1024
         out_dim: 32
+    strict: false
+    train:
+      strategy: full
+    mode: train
+    save: full
     gradient_checkpointing: true
 
   jsd:
+    target: models.vae.npu.jsd.JointSegDecoder
     params:
+      z_channels: 32
+      a_tex_channels: 32
       resolution: 1024
-    gradient_checkpointing: true
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: [2, 3, 2, 2]
+      in_channels: 3
+      seg_channels: 1
+      decoder_target: models.vae.npu.f8c32_swin.Decoder
+      decoder_activation: swish
+      image_post_quant_conv: true
+      image_embed_dim: 32
+      image_latent_shift_factor: 0.07050679
+      image_latent_scaling_factor: 0.2517327
+      image_output_scale: 1.0
+      image_output_shift: 0.0
+      cdib_levels: [3, 2, 1]
+    train:
+      strategy: full
+    mode: train
+    save: full
+    gradient_checkpointing: true       # needed at 1024 on <=96GB GPU
+
+optimizers:
+  dit_optim:
+    type: adamw
+    lr: 5.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - dit
+  jsd_optim:
+    type: adamw
+    lr: 5.0e-5
+    weight_decay: 0.0
+    params:
+      include:
+        - jsd
+
+losses:
+  sr:
+    target: models.loss.tadisr_loss.TADiSRLoss
+    params:
+      w_l2: 1.0
+      w_lpips: 0.0           # set to 5.0 once `pip install lpips` is available
+      w_mf: 10.0
+      focal_gamma: 2.0
+    inputs:
+      pred: pred.rgb
+      target: batch.hr_norm
+      pred_seg: pred.seg
+      target_seg: batch.mask
+    weight: 1.0
+  seg:
+    target: models.loss.seg_loss.SegLoss
+    params:
+      w_l2: 1.0
+      w_focal: 10.0
+      w_dice: 1.0
+      focal_gamma: 2.0
+      focal_alpha: 0.25
+    inputs:
+      pred: pred.seg
+      target: batch.mask
+    weight: 1.0
+
+train_program:
+  phases:
+    - name: generator
+      trainable: [dit, jsd]
+      zero_grad: [dit_optim, jsd_optim]
+      backward: true
+      step: [dit_optim, jsd_optim]
+      ops:
+        vae_encode:
+          component: vae_encoder
+          inputs:
+            x: batch.lr
+          outputs:
+            latent: lq.latent
+        text_encode:
+          component: offline_embedding
+          method: get_embedding
+          inputs:
+            text: batch.prompt
+            model_id:
+              type: const
+              value: pangu_1b_vl
+          outputs:
+            encoder_hidden_states: encoder_hidden_states
+        dit_sr:
+          type: nch_mmdit_sr
+          component: dit
+          input_type: lq
+          timestep: 1.0
+          mask_repeat: 2
+          enable_skip_level: "100"
+          denoise: true
+          extract_a_tex: true
+          inputs:
+            latent: lq.latent
+            encoder_hidden_states: encoder_hidden_states
+          outputs:
+            latent_denoised: pred.latent_denoised
+            a_tex: pred.a_tex
+        jsd_decode:
+          type: jsd_decode
+          component: jsd
+          inputs:
+            latent: pred.latent_denoised
+            a_tex: pred.a_tex
+          outputs:
+            recon: pred.rgb
+            seg: pred.seg
+        rescale_hr:
+          type: rescale
+          input: batch.hr
+          scale: 2.0
+          shift: -1.0
+          output: batch.hr_norm
+        make_taca_heatmap:
+          type: make_heatmap
+          input: pred.a_tex
+          grid_source: lq.latent      # infer token grid from VAE latent H,W
+          patchify: 2                 # DiT internal patchify=2 -> grid = H/2 x W/2
+          target_h: 1024
+          target_w: 1024
+          reduce: norm
+          normalize: true
+          output: pred.taca_heatmap
+      losses:
+        - sr
+        - seg
 
 logging:
   reduce_metrics: true
   backends:
     tensorboard:
       enabled: true
-      log_dir: null
+      log_dir: null                  # auto -> output_dir/tensorboard
   images:
     enabled: true
     every_n_steps: 100
-    max_images: 1
+    max_images: 1                    # batch_size=1
     items:
-      - { tag: lq,       key: batch.lr,   value_range: "0_1",  max_images: 1 }
-      - { tag: gt,       key: batch.hr,   value_range: "0_1",  max_images: 1 }
-      - { tag: gt_mask,  key: batch.mask, value_range: "0_1",  max_images: 1 }
-      - { tag: pred_rgb, key: pred.rgb,   value_range: "-1_1", max_images: 1 }
-      - { tag: pred_seg, key: pred.seg,   value_range: "0_1",  max_images: 1 }
+      - { tag: lq,           key: batch.lr,           value_range: "0_1",  max_images: 1 }
+      - { tag: gt,           key: batch.hr,           value_range: "0_1",  max_images: 1 }
+      - { tag: gt_mask,      key: batch.mask,         value_range: "0_1",  max_images: 1 }
+      - { tag: pred_rgb,     key: pred.rgb,           value_range: "-1_1", max_images: 1 }
+      - { tag: pred_seg,     key: pred.seg,           value_range: "0_1",  max_images: 1 }
+      - { tag: taca_heatmap, key: pred.taca_heatmap,  value_range: "0_1",  max_images: 1 }
+
+profiling:
+  enabled: false
 
 checkpoint:
   save_every_steps: 200
-  keep_last: 1
-  save_optimizer: false
+  keep_last: 1                 # only keep the most recent step-ckpt on disk
+  save_optimizer: false        # opt state doubles size; skip on Colab /content disk
   save_scheduler: false
