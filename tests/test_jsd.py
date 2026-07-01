@@ -3,7 +3,7 @@ Stage-3 JSD (Joint Segmentation Decoder) tests.
 
 Covers:
 - CDIB zero-initialized residual is identity at start, with gradient flow
-  to the residual scale parameters.
+  to the residual adapter parameters.
 - CDIB shape preservation and cross-branch interaction.
 - JointSegDecoder output shapes (recon RGB + seg mask), seg range [0,1],
   a_tex seq->spatial reshape, and gradient flow to both branches.
@@ -42,7 +42,7 @@ class CDIBTest(unittest.TestCase):
         self.assertEqual(z_out.shape, z.shape)
         self.assertEqual(a_out.shape, a.shape)
 
-    def test_scale_grad_flows(self):
+    def test_adapter_grad_flows(self):
         cdib = CDIB(channels=64)
         z = torch.randn(1, 64, 4, 4)
         a = torch.randn(1, 64, 4, 4)
@@ -50,6 +50,10 @@ class CDIBTest(unittest.TestCase):
         (z_out.sum() + a_out.sum()).backward()
         self.assertIsNotNone(cdib.scale_img.grad)
         self.assertIsNotNone(cdib.scale_seg.grad)
+        self.assertIsNotNone(cdib.out_img.weight.grad)
+        self.assertIsNotNone(cdib.out_seg.weight.grad)
+        self.assertGreater(cdib.out_img.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(cdib.out_seg.weight.grad.abs().sum().item(), 0.0)
 
 
 class JointSegDecoderTest(unittest.TestCase):
@@ -110,6 +114,15 @@ class JointSegDecoderTest(unittest.TestCase):
         jsd = self._make(resolution=128)
         self.assertEqual(jsd.cdib_levels, [4, 3, 2, 1])
 
+    def test_initial_segmentation_is_neutral_low_confidence(self):
+        jsd = self._make(resolution=128)
+        latent = torch.zeros(1, 64, 8, 8)
+        a_tex = torch.zeros(1, 16, 64)
+        out = jsd(latent, a_tex)
+        expected = torch.full_like(out["seg"], torch.sigmoid(torch.tensor(-4.0)))
+        self.assertTrue(torch.allclose(out["seg"], expected, atol=1e-6))
+        self.assertLess(out["seg"].std().item(), 1e-6)
+
     def test_f8c32_decoder_layout(self):
         torch.manual_seed(2)
         jsd = JointSegDecoder(
@@ -138,6 +151,8 @@ class JointSegDecoderTest(unittest.TestCase):
         self.assertEqual(out["recon"].shape, (1, 3, 64, 64))
         self.assertEqual(out["seg"].shape, (1, 1, 64, 64))
         self.assertEqual(jsd.cdib_levels, [3, 2, 1])
+        expected_seg = torch.full_like(out["seg"], torch.sigmoid(torch.tensor(-4.0)))
+        self.assertTrue(torch.allclose(out["seg"], expected_seg, atol=1e-6))
 
     def test_image_branch_identity_without_cdib(self):
         # With CDIB at no levels, image branch == plain VAE decode path.
@@ -147,6 +162,21 @@ class JointSegDecoderTest(unittest.TestCase):
         torch.manual_seed(1)
         jsd = self._make(resolution=128, cdib_levels=[])
         torch.manual_seed(1)
+        ref = Decoder(z_channels=64, resolution=128)
+        ref.load_state_dict(jsd.image_decoder.state_dict())
+        latent = torch.randn(1, 64, 8, 8)
+        a_tex = torch.randn(1, 16, 64)
+        jsd_recon = jsd(latent, a_tex)["recon"]
+        expected = 1.0 / SCALING_FACTOR * ref(latent) + SHIFTING_FACTOR
+        self.assertTrue(torch.allclose(jsd_recon, expected, atol=1e-6))
+
+    def test_image_branch_identity_with_default_cdib(self):
+        # Default CDIB levels should still be identity at initialization.
+        from models.vae.npu.f16c64 import SHIFTING_FACTOR, SCALING_FACTOR
+        from models.vae.npu.mj64_vae import Decoder
+
+        torch.manual_seed(4)
+        jsd = self._make(resolution=128)
         ref = Decoder(z_channels=64, resolution=128)
         ref.load_state_dict(jsd.image_decoder.state_dict())
         latent = torch.randn(1, 64, 8, 8)
