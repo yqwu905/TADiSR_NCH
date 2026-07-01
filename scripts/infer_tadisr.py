@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import cv2
 import torch
@@ -18,10 +18,18 @@ from framework.components import ComponentManager
 from framework.config import load_config
 from framework.context import TrainContext
 from framework.engine import move_to_device
+from framework.loggers import to_log_images
 from framework.phase_runner import PhaseRunner
 
 
 logger = logging.getLogger(__name__)
+
+WANDB_IMAGE_SPECS = {
+    "lr": {"key": "batch.lr", "value_range": "0_1", "colorize": False},
+    "pred": {"key": "pred.rgb", "value_range": "-1_1", "colorize": False},
+    "seg": {"key": "pred.seg", "value_range": "0_1", "colorize": False},
+    "heatmap": {"key": "pred.taca_heatmap", "value_range": "0_1", "colorize": True},
+}
 
 
 def _plain(value: Any) -> Any:
@@ -222,6 +230,16 @@ def _set_dit_runtime_options(
             op["denoise"] = bool(denoise)
 
 
+def _ctx_get_optional(ctx: TrainContext, key: str):
+    try:
+        return ctx.get(key, required=False)
+    except TypeError:
+        try:
+            return ctx.get(key)
+        except KeyError:
+            return None
+
+
 def _to_uint8(tensor: torch.Tensor, value_range: str) -> Any:
     image = tensor.detach().float().cpu()
     if value_range == "-1_1":
@@ -237,6 +255,174 @@ def _to_uint8(tensor: torch.Tensor, value_range: str) -> Any:
     if image.ndim == 3 and image.shape[-1] == 1:
         image = image[..., 0]
     return (image.numpy() * 255.0 + 0.5).astype("uint8")
+
+
+def parse_csv_list(value: Optional[str | Sequence[str]]) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.split(",")
+    else:
+        raw = []
+        for item in value:
+            raw.extend(str(item).split(","))
+    return [item.strip() for item in raw if item.strip()]
+
+
+def parse_wandb_images(value: str) -> list[str]:
+    names = parse_csv_list(value)
+    if not names or any(name.lower() == "all" for name in names):
+        names = list(WANDB_IMAGE_SPECS)
+    names = [name.lower() for name in names]
+    unknown = sorted(set(names) - set(WANDB_IMAGE_SPECS))
+    if unknown:
+        raise ValueError(
+            f"unknown --wandb-images values: {unknown}; "
+            f"expected any of {sorted(WANDB_IMAGE_SPECS)}"
+        )
+    return names
+
+
+def _wandb_cfg_from_config(cfg) -> dict:
+    logging_cfg = _plain(cfg.get("logging", {})) or {}
+    backends = logging_cfg.get("backends", {}) or {}
+
+    if isinstance(backends, Mapping):
+        wandb_cfg = dict(backends.get("wandb", {}) or {})
+        wandb_cfg.setdefault("type", "wandb")
+        return wandb_cfg
+
+    for backend in backends:
+        backend = dict(_plain(backend) or {})
+        if str(backend.get("type", "")).lower() in {"wandb", "weights_and_biases"}:
+            return backend
+
+    return {}
+
+
+def init_wandb(args, cfg, output_dir: Path):
+    if not args.wandb:
+        return None, None
+
+    try:
+        import wandb
+    except Exception as e:
+        raise ImportError(
+            "W&B inference logging requires wandb. Install with: uv sync --group logging "
+            "or pip install wandb"
+        ) from e
+
+    backend_cfg = _wandb_cfg_from_config(cfg)
+    params = dict(backend_cfg.get("params", {}) or {})
+    params.setdefault("dir", args.wandb_dir or backend_cfg.get("dir") or str(output_dir))
+    params.setdefault("job_type", args.wandb_job_type or backend_cfg.get("job_type") or "inference")
+
+    for arg_name, cfg_name in (
+        ("wandb_project", "project"),
+        ("wandb_entity", "entity"),
+        ("wandb_name", "name"),
+        ("wandb_group", "group"),
+        ("wandb_mode", "mode"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is None:
+            value = backend_cfg.get(cfg_name)
+        if value is not None:
+            params[cfg_name] = value
+
+    tags = parse_csv_list(args.wandb_tags)
+    if not tags:
+        tags = list(backend_cfg.get("tags", []) or [])
+    if tags:
+        params["tags"] = tags
+
+    params["config"] = {
+        "config_path": args.config,
+        "checkpoint": args.checkpoint,
+        "input": args.input,
+        "target_size": args.target_size,
+        "wandb_images": args.wandb_images,
+    }
+    run = wandb.init(**params)
+    return wandb, run
+
+
+def _tensor_to_wandb_image_array(
+    tensor: torch.Tensor,
+    *,
+    value_range: str,
+    colorize: bool = False,
+):
+    images = to_log_images(tensor, value_range=value_range, max_images=1)
+    if images is None or images.shape[0] == 0:
+        return None
+    image = images[0]
+    array = _to_uint8(image, value_range="0_1")
+    if colorize:
+        if array.ndim == 3:
+            array = array[..., 0]
+        array = cv2.applyColorMap(array, cv2.COLORMAP_TURBO)
+        array = cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+    return array
+
+
+def log_wandb_batch(
+    wandb,
+    ctx: TrainContext,
+    batch: Mapping[str, Any],
+    *,
+    step: int,
+    image_names: Sequence[str],
+    prefix: str = "inference",
+    log_every: int = 1,
+) -> int:
+    if wandb is None or not image_names:
+        return 0
+
+    ref = _ctx_get_optional(ctx, "pred.rgb")
+    if ref is None:
+        ref = _ctx_get_optional(ctx, "batch.lr")
+    if not torch.is_tensor(ref):
+        return 0
+
+    batch_size = int(ref.shape[0])
+    stems = _batch_list(batch, "stem", "sample", batch_size)
+    paths = _batch_list(batch, "path", "", batch_size)
+    logged = 0
+    log_every = max(int(log_every), 1)
+
+    for idx in range(batch_size):
+        sample_step = step + idx
+        if sample_step % log_every != 0:
+            continue
+
+        stem = stems[idx] if idx < len(stems) else f"sample_{idx:04d}"
+        input_path = paths[idx] if idx < len(paths) else ""
+        caption_base = f"{stem}" if not input_path else f"{stem} ({input_path})"
+        payload = {f"{prefix}/sample_index": sample_step}
+
+        for name in image_names:
+            spec = WANDB_IMAGE_SPECS[name]
+            value = _ctx_get_optional(ctx, spec["key"])
+            if not torch.is_tensor(value) or idx >= int(value.shape[0]):
+                continue
+            array = _tensor_to_wandb_image_array(
+                value[idx],
+                value_range=str(spec["value_range"]),
+                colorize=bool(spec["colorize"]),
+            )
+            if array is None:
+                continue
+            payload[f"{prefix}/{name}"] = wandb.Image(
+                array,
+                caption=f"{caption_base} | {name}",
+            )
+
+        if len(payload) > 1:
+            wandb.log(payload, step=sample_step)
+            logged += 1
+
+    return logged
 
 
 def save_tensor_image(
@@ -352,12 +538,13 @@ def run(args) -> None:
         if device.type == "cpu":
             mixed_precision = "no"
 
+    wandb_image_names = parse_wandb_images(args.wandb_images) if args.wandb else []
     component_names = list(cfg.get("components", {}).keys())
     phase = make_inference_phase(
         _find_first_phase(cfg),
         component_names,
         target_size,
-        include_heatmap=args.save_heatmap,
+        include_heatmap=args.save_heatmap or "heatmap" in wandb_image_names,
     )
     _set_dit_runtime_options(
         phase,
@@ -407,38 +594,57 @@ def run(args) -> None:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.jsonl"
+    wandb_mod, wandb_run = init_wandb(args, cfg, output_dir)
+    if wandb_mod is not None:
+        logger.info("[inference] wandb logging images: %s", ", ".join(wandb_image_names))
 
     total = 0
-    with manifest_path.open("w", encoding="utf-8") as manifest:
-        for batch in loader:
-            if args.max_images is not None and total >= args.max_images:
-                break
-            remaining = None if args.max_images is None else args.max_images - total
-            if remaining is not None and batch["lr"].shape[0] > remaining:
-                keep = int(remaining)
-                batch = {
-                    key: value[:keep] if torch.is_tensor(value) else value[:keep]
-                    for key, value in batch.items()
-                }
+    try:
+        with manifest_path.open("w", encoding="utf-8") as manifest:
+            for batch in loader:
+                if args.max_images is not None and total >= args.max_images:
+                    break
+                remaining = None if args.max_images is None else args.max_images - total
+                if remaining is not None and batch["lr"].shape[0] > remaining:
+                    keep = int(remaining)
+                    batch = {
+                        key: value[:keep] if torch.is_tensor(value) else value[:keep]
+                        for key, value in batch.items()
+                    }
 
-            batch = move_to_device(batch, device)
-            ctx = TrainContext(global_step=total, batch=batch)
-            with torch.no_grad():
-                runner.run(ctx, phase, do_zero_grad=False, do_step=False)
+                batch = move_to_device(batch, device)
+                ctx = TrainContext(global_step=total, batch=batch)
+                with torch.no_grad():
+                    runner.run(ctx, phase, do_zero_grad=False, do_step=False)
 
-            records = save_outputs(
-                ctx,
-                batch,
-                output_dir,
-                save_lr=args.save_lr,
-                save_seg=args.save_seg,
-                save_heatmap=args.save_heatmap,
-                restore_input_size=args.restore_input_size,
-            )
-            for record in records:
-                manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-            total += len(records)
-            logger.info("[inference] saved %s/%s", total, len(dataset))
+                records = save_outputs(
+                    ctx,
+                    batch,
+                    output_dir,
+                    save_lr=args.save_lr,
+                    save_seg=args.save_seg,
+                    save_heatmap=args.save_heatmap,
+                    restore_input_size=args.restore_input_size,
+                )
+                if wandb_mod is not None:
+                    log_wandb_batch(
+                        wandb_mod,
+                        ctx,
+                        batch,
+                        step=total,
+                        image_names=wandb_image_names,
+                        prefix=args.wandb_prefix,
+                        log_every=args.wandb_log_every,
+                    )
+                for record in records:
+                    manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+                total += len(records)
+                logger.info("[inference] saved %s/%s", total, len(dataset))
+    finally:
+        if wandb_run is not None:
+            finish = getattr(wandb_run, "finish", None)
+            if finish is not None:
+                finish()
 
     logger.info("[inference] wrote manifest: %s", manifest_path)
 
@@ -470,6 +676,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-seg", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-heatmap", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--restore-input-size", action="store_true")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--wandb-project")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-name")
+    parser.add_argument("--wandb-group")
+    parser.add_argument("--wandb-job-type")
+    parser.add_argument("--wandb-tags", help="comma-separated W&B tags")
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb-dir")
+    parser.add_argument("--wandb-prefix", default="inference")
+    parser.add_argument("--wandb-images", default="lr,pred,seg,heatmap")
+    parser.add_argument("--wandb-log-every", type=int, default=1)
     parser.add_argument("--timestep", type=float)
     parser.add_argument("--enable-skip-level")
     parser.add_argument("--denoise", action=argparse.BooleanOptionalAction, default=None)

@@ -6,13 +6,17 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from omegaconf import OmegaConf
 
 from data.inference_image_dataset import InferenceImageDataset, inference_collate_fn
+from framework.context import TrainContext
 from scripts.infer_tadisr import (
     apply_checkpoint_to_config,
     infer_target_size,
+    log_wandb_batch,
     make_inference_phase,
+    parse_wandb_images,
 )
 
 
@@ -97,6 +101,26 @@ class InferenceScriptHelpersTest(unittest.TestCase):
         self.assertEqual(infer_phase["ops"][1]["target_w"], 384)
         self.assertEqual(infer_phase["modes"], {"vae_encoder": "eval", "dit": "eval"})
 
+    def test_inference_phase_can_skip_heatmap_when_not_requested(self):
+        phase = OmegaConf.create(
+            {
+                "name": "generator",
+                "ops": {
+                    "vae_encode": {"component": "vae_encoder"},
+                    "make_taca_heatmap": {"type": "make_heatmap"},
+                },
+            }
+        )
+
+        infer_phase = make_inference_phase(
+            phase,
+            ["vae_encoder"],
+            (256, 256),
+            include_heatmap=False,
+        )
+
+        self.assertEqual([op["name"] for op in infer_phase["ops"]], ["vae_encode"])
+
     def test_infer_target_size_prefers_cli_then_config(self):
         cfg = OmegaConf.create(
             {
@@ -115,6 +139,65 @@ class InferenceScriptHelpersTest(unittest.TestCase):
 
         self.assertEqual(infer_target_size(cfg, "128x256"), (128, 256))
         self.assertEqual(infer_target_size(cfg, None), (1024, 768))
+
+    def test_parse_wandb_images_validates_values(self):
+        self.assertEqual(parse_wandb_images("lr,pred,seg,heatmap"), ["lr", "pred", "seg", "heatmap"])
+        self.assertEqual(parse_wandb_images("all"), ["lr", "pred", "seg", "heatmap"])
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            parse_wandb_images("lr,bad")
+
+    def test_log_wandb_batch_uploads_requested_images(self):
+        class FakeImage:
+            def __init__(self, data, caption=None):
+                self.data = data
+                self.caption = caption
+
+        class FakeWandb:
+            Image = FakeImage
+
+            def __init__(self):
+                self.logs = []
+
+            def log(self, payload, step=None):
+                self.logs.append((payload, step))
+
+        batch = {
+            "lr": torch.zeros(1, 3, 4, 6),
+            "stem": ["sample"],
+            "path": ["/tmp/sample.png"],
+        }
+        ctx = TrainContext(batch=batch)
+        ctx.set("pred.rgb", torch.zeros(1, 3, 4, 6))
+        ctx.set("pred.seg", torch.ones(1, 1, 4, 6))
+        ctx.set("pred.taca_heatmap", torch.rand(1, 1, 4, 6))
+
+        fake = FakeWandb()
+        logged = log_wandb_batch(
+            fake,
+            ctx,
+            batch,
+            step=7,
+            image_names=["lr", "pred", "seg", "heatmap"],
+        )
+
+        self.assertEqual(logged, 1)
+        self.assertEqual(len(fake.logs), 1)
+        payload, step = fake.logs[0]
+        self.assertEqual(step, 7)
+        self.assertEqual(
+            sorted(k for k in payload if k.startswith("inference/")),
+            [
+                "inference/heatmap",
+                "inference/lr",
+                "inference/pred",
+                "inference/sample_index",
+                "inference/seg",
+            ],
+        )
+        self.assertEqual(payload["inference/lr"].data.shape, (4, 6, 3))
+        self.assertEqual(payload["inference/seg"].data.shape, (4, 6))
+        self.assertEqual(payload["inference/heatmap"].data.shape, (4, 6, 3))
+        self.assertIn("sample", payload["inference/pred"].caption)
 
 
 if __name__ == "__main__":
