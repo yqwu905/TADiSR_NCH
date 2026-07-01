@@ -935,7 +935,9 @@ class NCHAttnProcessor2_0:
             )
 
     @staticmethod
-    def _slice_mask_for_taca(attention_mask, text_seq_len, start, end):
+    def _slice_mask_for_taca(
+        attention_mask, text_seq_len, start, end, text_only_normalization=False
+    ):
         """Slice the query dimension of ``attention_mask`` for one chunk."""
         if attention_mask is None:
             return None
@@ -943,8 +945,12 @@ class NCHAttnProcessor2_0:
         lo = text_seq_len + start
         hi = text_seq_len + end
         if s_q < hi:
-            return attention_mask
-        return attention_mask[..., lo:hi, :]
+            mask = attention_mask
+        else:
+            mask = attention_mask[..., lo:hi, :]
+        if text_only_normalization:
+            mask = mask[..., :text_seq_len]
+        return mask
 
     @staticmethod
     def _taca_chunk(q_chunk, key, idx, scale, mask_chunk=None):
@@ -975,7 +981,11 @@ class NCHAttnProcessor2_0:
             tokens occupy the first ``S_text`` positions.
         taca_cfg : dict
             Keys: ``text_seq_len``, ``text_token_indices``,
-            ``query_chunk_size``, ``use_checkpoint``.
+            ``query_chunk_size``, ``use_checkpoint``. If
+            ``text_only_normalization`` is true, probabilities are normalized
+            over text keys only, matching the original TACA cross-attention
+            formulation; otherwise they are sliced from the full joint
+            text+image attention matrix.
         attention_mask : Tensor or None
             Optional attention mask for the query dimension.
         scale : float
@@ -990,19 +1000,31 @@ class NCHAttnProcessor2_0:
         text_token_indices = list(taca_cfg["text_token_indices"])
         chunk_size = int(taca_cfg.get("query_chunk_size", 0)) or query.shape[2]
         use_ckpt = bool(taca_cfg.get("use_checkpoint", True))
+        text_only_normalization = bool(
+            taca_cfg.get("text_only_normalization", False)
+        )
 
         q_img = query[:, :, text_seq_len:, :]
         s_img = q_img.shape[2]
+        invalid = [
+            i for i in text_token_indices if i < 0 or i >= text_seq_len
+        ]
+        if invalid:
+            raise IndexError(
+                f"TACA text_token_indices out of range for text_seq_len "
+                f"{text_seq_len}: {invalid}"
+            )
         idx = torch.as_tensor(
             text_token_indices, dtype=torch.long, device=key.device
         )
+        key_for_taca = key[:, :, :text_seq_len, :] if text_only_normalization else key
 
         chunks = []
         for start in range(0, s_img, chunk_size):
             end = min(start + chunk_size, s_img)
             q_chunk = q_img[:, :, start:end, :]
             mask_chunk = self._slice_mask_for_taca(
-                attention_mask, text_seq_len, start, end
+                attention_mask, text_seq_len, start, end, text_only_normalization
             )
             if (
                 use_ckpt
@@ -1011,12 +1033,12 @@ class NCHAttnProcessor2_0:
             ):
                 chunk = torch.utils.checkpoint.checkpoint(
                     self._taca_chunk,
-                    q_chunk, key, idx, scale, mask_chunk,
+                    q_chunk, key_for_taca, idx, scale, mask_chunk,
                     use_reentrant=False,
                 )
             else:
                 chunk = self._taca_chunk(
-                    q_chunk, key, idx, scale, mask_chunk
+                    q_chunk, key_for_taca, idx, scale, mask_chunk
                 )
             chunks.append(chunk)
 

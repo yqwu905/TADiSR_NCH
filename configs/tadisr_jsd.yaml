@@ -107,6 +107,7 @@ components:
         text_token_indices: [8]
         query_chunk_size: 1024
         use_checkpoint: false
+        text_only_normalization: true
         out_dim: 64
     strict: false
     train:

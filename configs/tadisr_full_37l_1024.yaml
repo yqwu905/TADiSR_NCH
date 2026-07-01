@@ -8,7 +8,7 @@
 #   dit_sr(..., extract_a_tex=true)               -> pred.latent_denoised + pred.a_tex
 #   jsd_decode(...)                               -> pred.rgb + pred.seg
 #   rescale_hr(batch.hr, 2*x-1)                   -> batch.hr_norm   # [0,1]->[-1,1]
-#   make_heatmap(pred.a_tex)                      -> pred.taca_heatmap
+#   make_heatmap(pred.taca_attention)             -> pred.taca_heatmap
 #   sr_loss(pred.rgb, batch.hr_norm, pred.seg, batch.mask)
 #   seg_loss(pred.seg, batch.mask)
 #
@@ -127,6 +127,7 @@ components:
         text_token_indices: [8]
         query_chunk_size: 1024
         use_checkpoint: true                       # save memory under 1024
+        text_only_normalization: true              # paper-style image->text cross attention
         out_dim: 64
     strict: false
     train:
@@ -233,6 +234,7 @@ train_program:
           outputs:
             latent_denoised: pred.latent_denoised
             a_tex: pred.a_tex
+            taca_attention: pred.taca_attention
         jsd_decode:
           type: jsd_decode
           component: jsd
@@ -250,12 +252,12 @@ train_program:
           output: batch.hr_norm
         make_taca_heatmap:
           type: make_heatmap
-          input: pred.a_tex
+          input: pred.taca_attention
           grid_source: lq.latent      # infer token grid from VAE latent H,W
           patchify: 2                 # DiT internal patchify=2 -> grid = H/2 x W/2
           target_h: 1024
           target_w: 1024
-          reduce: norm
+          reduce: mean
           normalize: true
           output: pred.taca_heatmap
       losses:

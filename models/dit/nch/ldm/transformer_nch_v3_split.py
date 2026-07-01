@@ -305,6 +305,9 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         self.taca_text_token_indices = list(taca_cfg.get("text_token_indices", []))
         self.taca_query_chunk_size = int(taca_cfg.get("query_chunk_size", 1024))
         self.taca_use_checkpoint = bool(taca_cfg.get("use_checkpoint", True))
+        self.taca_text_only_normalization = bool(
+            taca_cfg.get("text_only_normalization", False)
+        )
         self.taca = None
         if taca_cfg.get("enabled", False) and self.taca_layers and self.taca_text_token_indices:
             from .taca import TACAProjection
@@ -563,6 +566,7 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 "text_token_indices": self.taca_text_token_indices,
                 "query_chunk_size": self.taca_query_chunk_size,
                 "use_checkpoint": self.taca_use_checkpoint,
+                "text_only_normalization": self.taca_text_only_normalization,
             }
             for li in self.taca_layers:
                 if li < len(self.transformer_blocks):
@@ -629,11 +633,28 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 ori_hidden_states = hidden_states.reshape(bs*new_H, new_W, block_lenth_2D, -1).transpose(1, 2).reshape(bs, new_img_len, -1)
                 features.append(ori_hidden_states)
 
-        # TACA: project harvested attention slices into a_tex.
+        # TACA: project harvested attention slices into a_tex. Attention blocks
+        # run in block-interleaved token order, but downstream JSD/heatmap code
+        # expects the ordinary row-major patch grid.
         a_tex = None
+        taca_attention = None
         if collected_slices is not None and self.taca is not None:
             if len(collected_slices) == len(self.taca_layers):
                 a_tex = self.taca(collected_slices)
+                a_tex = self.unreshape1D(
+                    a_tex, new_H, new_W, block_lenth_2D, new_img_len
+                )
+
+                taca_attention = torch.stack(
+                    [
+                        s.detach().float().mean(dim=(1, 3))
+                        for s in collected_slices
+                    ],
+                    dim=0,
+                ).mean(dim=0).unsqueeze(-1)
+                taca_attention = self.unreshape1D(
+                    taca_attention, new_H, new_W, block_lenth_2D, new_img_len
+                )
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
@@ -670,7 +691,10 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             unscale_lora_layers(self, lora_scale)
 
         if a_tex is not None:
-            return {"sample": output, "a_tex": a_tex}
+            result = {"sample": output, "a_tex": a_tex}
+            if taca_attention is not None:
+                result["taca_attention"] = taca_attention
+            return result
 
         if not return_dict:
             return (output,)

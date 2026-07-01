@@ -340,8 +340,10 @@ class NCHMMDiTSROp:
         sample = self._extract_sample(model_result)
 
         a_tex = None
+        taca_attention = None
         if self.extract_a_tex and isinstance(model_result, dict):
             a_tex = model_result.get("a_tex")
+            taca_attention = model_result.get("taca_attention")
 
         if self.denoise:
             dt = 1.0 - self.timestep
@@ -352,6 +354,8 @@ class NCHMMDiTSROp:
         result = {"latent_denoised": sample}
         if a_tex is not None:
             result["a_tex"] = a_tex
+        if taca_attention is not None:
+            result["taca_attention"] = taca_attention
         outputs = self.cfg.get("outputs")
         if outputs is not None:
             _write_outputs(ctx, result, outputs)
@@ -359,6 +363,11 @@ class NCHMMDiTSROp:
             ctx.set(self.cfg.get("output", "pred.latent_denoised"), sample)
             if a_tex is not None:
                 ctx.set(self.cfg.get("a_tex_output", "pred.a_tex"), a_tex)
+            if taca_attention is not None:
+                ctx.set(
+                    self.cfg.get("taca_attention_output", "pred.taca_attention"),
+                    taca_attention,
+                )
 
     @staticmethod
     def _extract_sample(model_result):
