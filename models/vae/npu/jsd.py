@@ -4,8 +4,9 @@ Replaces the standard VAE image decoder with a dual-branch decoder that
 jointly produces a super-resolved image and a text segmentation mask.
 The image branch reuses the VAE ``Decoder`` structure (and optionally its
 weights); the segmentation branch is a symmetric decoder initialized from
-scratch. The two branches interact through Cross-Decoder Interaction
-Blocks (CDIB) inserted at selected decoder up-sampling levels.
+the image decoder where shapes match, with a neutral mask output head. The
+two branches interact through Cross-Decoder Interaction Blocks (CDIB)
+inserted at selected decoder up-sampling levels.
 
 Reference: TADiSR (Text-Aware Real-World Image Super-Resolution,
 NeurIPS 2025, arXiv:2506.04641), Section 3.3.
@@ -50,7 +51,14 @@ def _activation(name: str, x: torch.Tensor) -> torch.Tensor:
 class CDIB(nn.Module):
     """Cross-Decoder Interaction Block."""
 
-    def __init__(self, channels: int, num_groups: int = 32, dropout: float = 0.0):
+    def __init__(
+        self,
+        channels: int,
+        num_groups: int = 32,
+        dropout: float = 0.0,
+        zero_init_outputs: bool = True,
+        initial_scale: float = 1.0,
+    ):
         super().__init__()
         self.channels = int(channels)
         self.resblock_img = ResnetBlock(
@@ -71,8 +79,14 @@ class CDIB(nn.Module):
         self.norm_seg = Normalize(channels, num_groups=num_groups)
         self.out_img = nn.Conv2d(channels, channels, kernel_size=1)
         self.out_seg = nn.Conv2d(channels, channels, kernel_size=1)
-        self.scale_img = nn.Parameter(torch.zeros(1))
-        self.scale_seg = nn.Parameter(torch.zeros(1))
+        if zero_init_outputs:
+            nn.init.zeros_(self.out_img.weight)
+            nn.init.zeros_(self.out_img.bias)
+            nn.init.zeros_(self.out_seg.weight)
+            nn.init.zeros_(self.out_seg.bias)
+        scale = torch.full((1,), float(initial_scale))
+        self.scale_img = nn.Parameter(scale.clone())
+        self.scale_seg = nn.Parameter(scale.clone())
 
     def forward(
         self, z_img: torch.Tensor, a_seg: torch.Tensor
@@ -124,6 +138,10 @@ class JointSegDecoder(nn.Module):
         image_output_shift: float = SHIFTING_FACTOR,
         cdib_levels: Optional[Sequence[int]] = None,
         image_checkpoint: Optional[str] = None,
+        seg_init_from_image: bool = True,
+        seg_output_bias: float = -4.0,
+        zero_init_cdib_outputs: bool = True,
+        cdib_initial_scale: float = 1.0,
         **decoder_kwargs,
     ):
         super().__init__()
@@ -142,6 +160,10 @@ class JointSegDecoder(nn.Module):
         self.image_latent_scaling_factor = image_latent_scaling_factor
         self.image_output_scale = float(image_output_scale)
         self.image_output_shift = float(image_output_shift)
+        self.seg_init_from_image = bool(seg_init_from_image)
+        self.seg_output_bias = float(seg_output_bias)
+        self.zero_init_cdib_outputs = bool(zero_init_cdib_outputs)
+        self.cdib_initial_scale = float(cdib_initial_scale)
         self.gradient_checkpointing = False
 
         block_in = self.ch * self.ch_mult[-1]
@@ -187,13 +209,19 @@ class JointSegDecoder(nn.Module):
         dropout = float(decoder_kwargs.get("dropout", 0.0))
         self.cdib = nn.ModuleDict(
             {
-                str(lvl): CDIB(ch * self.ch_mult[lvl], dropout=dropout)
+                str(lvl): CDIB(
+                    ch * self.ch_mult[lvl],
+                    dropout=dropout,
+                    zero_init_outputs=self.zero_init_cdib_outputs,
+                    initial_scale=self.cdib_initial_scale,
+                )
                 for lvl in self.cdib_levels
             }
         )
 
         if image_checkpoint:
             self._load_image_checkpoint(image_checkpoint)
+        self._init_segmentation_branch()
 
     def gradient_checkpointing_enable(self, enabled: bool = True) -> None:
         self.gradient_checkpointing = bool(enabled)
@@ -216,6 +244,11 @@ class JointSegDecoder(nn.Module):
             key = _strip_module_prefix(str(key))
             if key.startswith("image_decoder."):
                 prefixed[key] = value
+            elif (
+                key.startswith("image_post_quant_conv.")
+                and self.image_post_quant_conv is not None
+            ):
+                prefixed[key] = value
             elif key.startswith("decoder."):
                 prefixed[f"image_decoder.{key[len('decoder.'):]}"] = value
             elif key.startswith("model."):
@@ -227,7 +260,9 @@ class JointSegDecoder(nn.Module):
                 prefixed[
                     f"image_post_quant_conv.{key[len('post_quant_conv.'):]}"
                 ] = value
-            elif not key.startswith(("encoder.", "quant_conv.")):
+            elif not key.startswith(
+                ("encoder.", "quant_conv.", "seg_decoder.", "cdib.")
+            ):
                 prefixed[f"image_decoder.{key}"] = value
 
         missing, unexpected = self.load_state_dict(prefixed, strict=False)
@@ -235,6 +270,32 @@ class JointSegDecoder(nn.Module):
             f"[JointSegDecoder] loaded image checkpoint from {path}; "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
+
+    @staticmethod
+    def _copy_shape_matched_state(src: nn.Module, dst: nn.Module) -> int:
+        src_state = src.state_dict()
+        dst_state = dst.state_dict()
+        matched = {
+            key: value
+            for key, value in src_state.items()
+            if key in dst_state and tuple(value.shape) == tuple(dst_state[key].shape)
+        }
+        if matched:
+            dst.load_state_dict(matched, strict=False)
+        return len(matched)
+
+    def _init_segmentation_branch(self) -> None:
+        if self.seg_init_from_image:
+            self._copy_shape_matched_state(self.image_decoder, self.seg_decoder)
+
+        conv_out = getattr(self.seg_decoder, "conv_out", None)
+        if conv_out is None:
+            return
+        with torch.no_grad():
+            if getattr(conv_out, "weight", None) is not None:
+                conv_out.weight.zero_()
+            if getattr(conv_out, "bias", None) is not None:
+                conv_out.bias.fill_(self.seg_output_bias)
 
     @staticmethod
     def _a_tex_to_spatial(a_tex: torch.Tensor, latent_shape: torch.Size) -> torch.Tensor:
