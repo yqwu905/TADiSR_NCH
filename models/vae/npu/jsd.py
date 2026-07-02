@@ -229,30 +229,24 @@ class _JointSegDecoderBase(nn.Module):
         if isinstance(sd, dict) and "state_dict" in sd:
             sd = sd["state_dict"]
 
-        image_post_quant_conv = getattr(self, "image_post_quant_conv", None)
         prefixed = {}
         for key, value in sd.items():
             key = _strip_module_prefix(str(key))
             if key.startswith("image_decoder."):
                 prefixed[key] = value
-            elif (
-                key.startswith("image_post_quant_conv.")
-                and image_post_quant_conv is not None
-            ):
-                prefixed[key] = value
             elif key.startswith("decoder."):
                 prefixed[f"image_decoder.{key[len('decoder.'):]}"] = value
             elif key.startswith("model."):
                 prefixed[f"image_decoder.{key[len('model.'):]}"] = value
-            elif (
-                key.startswith("post_quant_conv.")
-                and image_post_quant_conv is not None
-            ):
-                prefixed[
-                    f"image_post_quant_conv.{key[len('post_quant_conv.'):]}"
-                ] = value
             elif not key.startswith(
-                ("encoder.", "quant_conv.", "seg_decoder.", "cdib.")
+                (
+                    "encoder.",
+                    "quant_conv.",
+                    "post_quant_conv.",
+                    "image_post_quant_conv.",
+                    "seg_decoder.",
+                    "cdib.",
+                )
             ):
                 prefixed[f"image_decoder.{key}"] = value
 
@@ -384,9 +378,6 @@ class _JointSegDecoderBase(nn.Module):
                 modules.extend(level.attn)
             modules.extend([dec.mid.block_1, dec.mid.attn_1, dec.mid.block_2])
         modules.extend(list(self.cdib.values()))
-        image_post_quant_conv = getattr(self, "image_post_quant_conv", None)
-        if image_post_quant_conv is not None:
-            modules.append(image_post_quant_conv)
         return modules
 
 
@@ -457,7 +448,6 @@ class JointSegDecoderF16C64(_JointSegDecoderBase):
             zero_init_cdib_outputs=zero_init_cdib_outputs,
             cdib_initial_scale=cdib_initial_scale,
         )
-        self.image_post_quant_conv = None
         self.image_decoder = mj64_vae.Decoder(
             z_channels=z_channels,
             resolution=resolution,
@@ -476,21 +466,20 @@ class JointSegDecoderF16C64(_JointSegDecoderBase):
 
 
 class JointSegDecoderF8C32(_JointSegDecoderBase):
-    """JSD for the F8C32 Swin VAE decoder."""
+    """JSD for the F8C32 Swin VAE decoder.
+
+    The public initialization shape mirrors ``f8c32_swin.VaeDecoder``:
+    VAE structure lives in ``ddconfig`` or the same flat ddconfig keys, while
+    JSD-specific knobs stay as explicit arguments.
+    """
 
     def __init__(
         self,
-        z_channels: int,
         a_tex_channels: int,
-        resolution: int = 256,
-        ch: int = 128,
-        ch_mult: Sequence[int] = _F8_CH_MULT,
-        num_res_blocks: Sequence[int] = _F8_NUM_RES_BLOCKS,
-        in_channels: int = 3,
-        seg_channels: int = 1,
         embed_dim: int = 32,
         shift_factor: float = f8c32_swin.SHIFT_FACTOR,
         scaling_factor: float = f8c32_swin.SCALING_FACTOR,
+        seg_channels: int = 1,
         decoder_activation: str = "swish",
         image_output_scale: float = 1.0,
         image_output_shift: float = 0.0,
@@ -514,6 +503,31 @@ class JointSegDecoderF8C32(_JointSegDecoderBase):
             },
             type(self).__name__,
         )
+        ddconfig, rest = f8c32_swin._split_config(decoder_kwargs)
+        self.embed_dim = int(embed_dim)
+        self.shift_factor = float(rest.pop("shift_factor", shift_factor))
+        self.scaling_factor = float(rest.pop("scaling_factor", scaling_factor))
+        if rest:
+            unknown = ", ".join(sorted(rest))
+            raise TypeError(f"{type(self).__name__} got unexpected params: {unknown}")
+        ddconfig = dict(ddconfig)
+        z_channels = int(ddconfig.get("z_channels", self.embed_dim))
+        if self.embed_dim != z_channels:
+            raise ValueError(
+                "JointSegDecoderF8C32 no longer owns a post-quant conv, so "
+                f"embed_dim ({self.embed_dim}) must equal ddconfig.z_channels "
+                f"({z_channels})"
+            )
+        ddconfig["z_channels"] = z_channels
+        ch = int(ddconfig.get("ch", 128))
+        ch_mult = _as_tuple(ddconfig.get("ch_mult", _F8_CH_MULT), "ddconfig.ch_mult")
+        num_res_blocks = _as_tuple(
+            ddconfig.get("num_res_blocks", _F8_NUM_RES_BLOCKS),
+            "ddconfig.num_res_blocks",
+        )
+        resolution = int(ddconfig.get("resolution", 256))
+        in_channels = int(ddconfig.get("in_channels", 3))
+
         super().__init__(
             z_channels=z_channels,
             a_tex_channels=a_tex_channels,
@@ -534,35 +548,17 @@ class JointSegDecoderF8C32(_JointSegDecoderBase):
             zero_init_cdib_outputs=zero_init_cdib_outputs,
             cdib_initial_scale=cdib_initial_scale,
         )
-        self.embed_dim = int(embed_dim)
-        self.shift_factor = float(shift_factor)
-        self.scaling_factor = float(scaling_factor)
-        self.image_post_quant_conv = nn.Conv2d(self.embed_dim, z_channels, kernel_size=1)
-        self.image_decoder = f8c32_swin.Decoder(
-            z_channels=z_channels,
-            resolution=resolution,
-            ch=ch,
-            ch_mult=self.ch_mult,
-            num_res_blocks=self.num_res_blocks,
-            in_channels=in_channels,
-            out_ch=in_channels,
-            **decoder_kwargs,
-        )
-        self.seg_decoder = f8c32_swin.Decoder(
-            z_channels=a_tex_channels,
-            resolution=resolution,
-            ch=ch,
-            ch_mult=self.ch_mult,
-            num_res_blocks=self.num_res_blocks,
-            in_channels=seg_channels,
-            out_ch=seg_channels,
-            **decoder_kwargs,
-        )
+        self.ddconfig = ddconfig
+        self.image_decoder = f8c32_swin.Decoder(**ddconfig)
+        seg_ddconfig = dict(ddconfig)
+        seg_ddconfig["z_channels"] = a_tex_channels
+        seg_ddconfig["in_channels"] = seg_channels
+        seg_ddconfig["out_ch"] = seg_channels
+        self.seg_decoder = f8c32_swin.Decoder(**seg_ddconfig)
         self._finish_initialization(image_checkpoint)
 
     def _prepare_image_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        z = latent / self.scaling_factor + self.shift_factor
-        return self.image_post_quant_conv(z)
+        return latent / self.scaling_factor + self.shift_factor
 
 
 # Backward-compatible F16 name. New configs should use the explicit classes.

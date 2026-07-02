@@ -117,17 +117,22 @@ components:
   jsd:
     target: models.vae.npu.jsd.JointSegDecoderF8C32
     params:
-      z_channels: 32
-      a_tex_channels: 32
-      resolution: 256
-      ch: 128
-      ch_mult: [1, 2, 4, 4]
-      num_res_blocks: [2, 3, 2, 2]
-      in_channels: 3
-      seg_channels: 1
       embed_dim: 32
       shift_factor: 0.07050679
       scaling_factor: 0.2517327
+      a_tex_channels: 32
+      seg_channels: 1
+      ddconfig:
+        double_z: true
+        z_channels: 32
+        resolution: 256
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult: [1, 2, 4, 4]
+        num_res_blocks: [2, 3, 2, 2]
+        attn_resolutions: []
+        dropout: 0.0
       cdib_levels: [3, 2, 1]
     train:
       strategy: full

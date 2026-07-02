@@ -131,20 +131,29 @@ class JointSegDecoderTest(unittest.TestCase):
     def test_f8c32_decoder_layout(self):
         torch.manual_seed(2)
         jsd = JointSegDecoderF8C32(
-            z_channels=32,
-            a_tex_channels=32,
-            resolution=64,
-            ch=32,
-            ch_mult=[1, 2, 4, 4],
-            num_res_blocks=[1, 1, 1, 1],
             embed_dim=32,
             shift_factor=0.07050679,
             scaling_factor=0.2517327,
+            a_tex_channels=32,
+            seg_channels=1,
             cdib_levels=[3, 2, 1],
-            swin_depths=[1],
-            swin_num_heads=[4],
-            swin_window_size=4,
+            ddconfig={
+                "double_z": True,
+                "z_channels": 32,
+                "resolution": 64,
+                "in_channels": 3,
+                "out_ch": 3,
+                "ch": 32,
+                "ch_mult": [1, 2, 4, 4],
+                "num_res_blocks": [1, 1, 1, 1],
+                "attn_resolutions": [],
+                "dropout": 0.0,
+                "swin_depths": [1],
+                "swin_num_heads": [4],
+                "swin_window_size": 4,
+            },
         )
+        self.assertFalse(hasattr(jsd, "image_post_quant_conv"))
         self.assertIsInstance(jsd.image_decoder, f8c32_swin.Decoder)
         self.assertIsInstance(jsd.seg_decoder, f8c32_swin.Decoder)
         self.assertIsInstance(
