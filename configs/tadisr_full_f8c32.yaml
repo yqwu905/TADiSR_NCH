@@ -115,7 +115,7 @@ components:
     save: full
 
   jsd:
-    target: models.vae.npu.jsd.JointSegDecoder
+    target: models.vae.npu.jsd.JointSegDecoderF8C32
     params:
       z_channels: 32
       a_tex_channels: 32
@@ -125,14 +125,9 @@ components:
       num_res_blocks: [2, 3, 2, 2]
       in_channels: 3
       seg_channels: 1
-      decoder_target: models.vae.npu.f8c32_swin.Decoder
-      decoder_activation: swish
-      image_post_quant_conv: true
-      image_embed_dim: 32
-      image_latent_shift_factor: 0.07050679
-      image_latent_scaling_factor: 0.2517327
-      image_output_scale: 1.0
-      image_output_shift: 0.0
+      embed_dim: 32
+      shift_factor: 0.07050679
+      scaling_factor: 0.2517327
       cdib_levels: [3, 2, 1]
     train:
       strategy: full

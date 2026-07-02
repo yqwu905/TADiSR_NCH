@@ -7,7 +7,7 @@ Covers:
 - CDIB shape preservation and cross-branch interaction.
 - JointSegDecoder output shapes (recon RGB + seg mask), seg range [0,1],
   a_tex seq->spatial reshape, and gradient flow to both branches.
-- F8C32 VAE wrapper and JSD decoder-target compatibility.
+- F8C32 VAE wrapper and dedicated F8C32 JSD decoder layout.
 - jsd_decode op glue: reads context, calls component, writes outputs.
 """
 from __future__ import annotations
@@ -19,15 +19,20 @@ import torch.nn as nn
 
 from framework.context import TrainContext
 from framework.ops.diffusion import JSDDecodeOp
+from models.vae.npu import f8c32_swin
 from models.vae.npu.f8c32_swin import VaeDecoder as F8C32Decoder
 from models.vae.npu.f8c32_swin import VaeEncoder as F8C32Encoder
-from models.vae.npu.jsd import CDIB, JointSegDecoder
+from models.vae.npu.jsd import (
+    CDIBF16C64,
+    JointSegDecoderF16C64,
+    JointSegDecoderF8C32,
+)
 
 
 class CDIBTest(unittest.TestCase):
     def test_zero_init_is_identity(self):
         torch.manual_seed(0)
-        cdib = CDIB(channels=64)
+        cdib = CDIBF16C64(channels=64)
         z = torch.randn(2, 64, 8, 8, requires_grad=True)
         a = torch.randn(2, 64, 8, 8, requires_grad=True)
         z_out, a_out = cdib(z, a)
@@ -35,7 +40,7 @@ class CDIBTest(unittest.TestCase):
         self.assertTrue(torch.allclose(a_out, a, atol=1e-6))
 
     def test_shape_preserved(self):
-        cdib = CDIB(channels=128)
+        cdib = CDIBF16C64(channels=128)
         z = torch.randn(1, 128, 4, 4)
         a = torch.randn(1, 128, 4, 4)
         z_out, a_out = cdib(z, a)
@@ -43,7 +48,7 @@ class CDIBTest(unittest.TestCase):
         self.assertEqual(a_out.shape, a.shape)
 
     def test_adapter_grad_flows(self):
-        cdib = CDIB(channels=64)
+        cdib = CDIBF16C64(channels=64)
         z = torch.randn(1, 64, 4, 4)
         a = torch.randn(1, 64, 4, 4)
         z_out, a_out = cdib(z, a)
@@ -58,7 +63,7 @@ class CDIBTest(unittest.TestCase):
 
 class JointSegDecoderTest(unittest.TestCase):
     def _make(self, resolution=128, a_tex_channels=64, cdib_levels=None):
-        return JointSegDecoder(
+        return JointSegDecoderF16C64(
             z_channels=64,
             a_tex_channels=a_tex_channels,
             resolution=resolution,
@@ -125,26 +130,27 @@ class JointSegDecoderTest(unittest.TestCase):
 
     def test_f8c32_decoder_layout(self):
         torch.manual_seed(2)
-        jsd = JointSegDecoder(
+        jsd = JointSegDecoderF8C32(
             z_channels=32,
             a_tex_channels=32,
             resolution=64,
             ch=32,
             ch_mult=[1, 2, 4, 4],
             num_res_blocks=[1, 1, 1, 1],
-            decoder_target="models.vae.npu.f8c32_swin.Decoder",
-            decoder_activation="swish",
-            image_post_quant_conv=True,
-            image_embed_dim=32,
-            image_latent_shift_factor=0.07050679,
-            image_latent_scaling_factor=0.2517327,
-            image_output_scale=1.0,
-            image_output_shift=0.0,
+            embed_dim=32,
+            shift_factor=0.07050679,
+            scaling_factor=0.2517327,
             cdib_levels=[3, 2, 1],
             swin_depths=[1],
             swin_num_heads=[4],
             swin_window_size=4,
         )
+        self.assertIsInstance(jsd.image_decoder, f8c32_swin.Decoder)
+        self.assertIsInstance(jsd.seg_decoder, f8c32_swin.Decoder)
+        self.assertIsInstance(
+            jsd.seg_decoder.conv_in, f8c32_swin.DecodeConvInShortcut
+        )
+        self.assertIsInstance(jsd.seg_decoder.mid.attn_1, f8c32_swin.SwinAttn)
         latent = torch.randn(1, 32, 8, 8)
         a_tex = torch.randn(1, 16, 32)
         out = jsd(latent, a_tex)
@@ -189,7 +195,7 @@ class JointSegDecoderTest(unittest.TestCase):
 class JSDDecodeOpTest(unittest.TestCase):
     def test_op_writes_recon_and_seg(self):
         torch.manual_seed(0)
-        jsd = JointSegDecoder(
+        jsd = JointSegDecoderF16C64(
             z_channels=64, a_tex_channels=64, resolution=128, ch=128
         )
         jsd.eval()

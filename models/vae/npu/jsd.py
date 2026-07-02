@@ -1,20 +1,14 @@
-"""Joint Segmentation Decoder (JSD) for TADiSR.
+"""Joint Segmentation Decoder (JSD) implementations for TADiSR.
 
-Replaces the standard VAE image decoder with a dual-branch decoder that
-jointly produces a super-resolved image and a text segmentation mask.
-The image branch reuses the VAE ``Decoder`` structure (and optionally its
-weights); the segmentation branch is a symmetric decoder initialized from
-the image decoder where shapes match, with a neutral mask output head. The
-two branches interact through Cross-Decoder Interaction Blocks (CDIB)
-inserted at selected decoder up-sampling levels.
-
-Reference: TADiSR (Text-Aware Real-World Image Super-Resolution,
-NeurIPS 2025, arXiv:2506.04641), Section 3.3.
+The F16C64 and F8C32 VAE families use different decoder internals, so they
+are exposed as separate JSD components instead of one parameter-switched class.
+Both implementations keep the TADiSR dual-branch shape: an image decoder, a
+segmentation decoder, and Cross-Decoder Interaction Blocks (CDIB) between
+matching up-sampling levels.
 """
 from __future__ import annotations
 
 import math
-from importlib import import_module
 from typing import Any, Optional, Sequence
 
 import torch
@@ -22,18 +16,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
-from .mj64_vae import Decoder, Normalize, ResnetBlock
+from . import f8c32_swin
+from . import mj64_vae
 
 SHIFTING_FACTOR = -0.02453034371137619
 SCALING_FACTOR = 1 / 0.7610968947410583
 
-_CH_MULT = (1, 2, 4, 4, 4)
-_NUM_RES_BLOCKS = (2, 3, 2, 2, 2)
-
-
-def _locate(target: str):
-    module_name, attr_name = target.rsplit(".", 1)
-    return getattr(import_module(module_name), attr_name)
+_F16_CH_MULT = (1, 2, 4, 4, 4)
+_F16_NUM_RES_BLOCKS = (2, 3, 2, 2, 2)
+_F8_CH_MULT = (1, 2, 4, 4)
+_F8_NUM_RES_BLOCKS = (2, 3, 2, 2)
 
 
 def _strip_module_prefix(key: str) -> str:
@@ -48,12 +40,29 @@ def _activation(name: str, x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"unknown decoder_activation: {name!r}")
 
 
-class CDIB(nn.Module):
-    """Cross-Decoder Interaction Block."""
+def _as_tuple(values: Sequence[int], name: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in values)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be a sequence of integers") from exc
+
+
+def _reject_params(kwargs: dict[str, Any], names: set[str], owner: str) -> None:
+    present = sorted(name for name in names if name in kwargs)
+    if present:
+        joined = ", ".join(present)
+        raise TypeError(f"{owner} does not accept shared-JSD switch params: {joined}")
+
+
+class _CDIBBase(nn.Module):
+    """Cross-Decoder Interaction Block shared by concrete VAE layouts."""
 
     def __init__(
         self,
         channels: int,
+        *,
+        resblock_cls: type[nn.Module],
+        normalize_fn: Any,
         num_groups: int = 32,
         dropout: float = 0.0,
         zero_init_outputs: bool = True,
@@ -61,13 +70,13 @@ class CDIB(nn.Module):
     ):
         super().__init__()
         self.channels = int(channels)
-        self.resblock_img = ResnetBlock(
+        self.resblock_img = resblock_cls(
             in_channels=channels,
             out_channels=channels,
             temb_channels=0,
             dropout=dropout,
         )
-        self.resblock_seg = ResnetBlock(
+        self.resblock_seg = resblock_cls(
             in_channels=channels,
             out_channels=channels,
             temb_channels=0,
@@ -75,8 +84,8 @@ class CDIB(nn.Module):
         )
         self.proj_img = nn.Conv2d(channels, channels * 2, kernel_size=1)
         self.proj_seg = nn.Conv2d(channels, channels * 2, kernel_size=1)
-        self.norm_img = Normalize(channels, num_groups=num_groups)
-        self.norm_seg = Normalize(channels, num_groups=num_groups)
+        self.norm_img = normalize_fn(channels, num_groups=num_groups)
+        self.norm_seg = normalize_fn(channels, num_groups=num_groups)
         self.out_img = nn.Conv2d(channels, channels, kernel_size=1)
         self.out_seg = nn.Conv2d(channels, channels, kernel_size=1)
         if zero_init_outputs:
@@ -108,56 +117,66 @@ class CDIB(nn.Module):
         return z_img_out, a_seg_out
 
 
-class JointSegDecoder(nn.Module):
-    """Joint Segmentation Decoder.
+class CDIBF16C64(_CDIBBase):
+    """CDIB using the F16C64 VAE ResNet/normalization blocks."""
 
-    The default parameters preserve the original F16C64 JSD behavior. For
-    F8C32, pass ``decoder_target='models.vae.npu.f8c32_swin.Decoder'``,
-    ``ch_mult=[1, 2, 4, 4]``, ``num_res_blocks=[2, 3, 2, 2]``,
-    ``image_post_quant_conv=True``, and the VAE latent shift/scaling
-    factors.
-    """
+    def __init__(self, channels: int, **kwargs: Any):
+        super().__init__(
+            channels,
+            resblock_cls=mj64_vae.ResnetBlock,
+            normalize_fn=mj64_vae.Normalize,
+            **kwargs,
+        )
 
+
+class CDIBF8C32(_CDIBBase):
+    """CDIB using the F8C32 Swin VAE ResNet/normalization blocks."""
+
+    def __init__(self, channels: int, **kwargs: Any):
+        super().__init__(
+            channels,
+            resblock_cls=f8c32_swin.ResnetBlock,
+            normalize_fn=f8c32_swin.Normalize,
+            **kwargs,
+        )
+
+
+class _JointSegDecoderBase(nn.Module):
     def __init__(
         self,
+        *,
         z_channels: int,
         a_tex_channels: int,
-        resolution: int = 512,
-        ch: int = 128,
-        ch_mult: Sequence[int] = _CH_MULT,
-        num_res_blocks: Sequence[int] = _NUM_RES_BLOCKS,
-        in_channels: int = 3,
-        seg_channels: int = 1,
-        decoder_target: str = "models.vae.npu.mj64_vae.Decoder",
-        decoder_activation: str = "silu",
-        image_post_quant_conv: bool = False,
-        image_embed_dim: Optional[int] = None,
-        image_latent_shift_factor: Optional[float] = None,
-        image_latent_scaling_factor: Optional[float] = None,
-        image_output_scale: float = 1.0 / SCALING_FACTOR,
-        image_output_shift: float = SHIFTING_FACTOR,
-        cdib_levels: Optional[Sequence[int]] = None,
-        image_checkpoint: Optional[str] = None,
-        seg_init_from_image: bool = True,
-        seg_output_bias: float = -4.0,
-        zero_init_cdib_outputs: bool = True,
-        cdib_initial_scale: float = 1.0,
-        **decoder_kwargs,
+        resolution: int,
+        ch: int,
+        ch_mult: Sequence[int],
+        num_res_blocks: Sequence[int],
+        in_channels: int,
+        seg_channels: int,
+        decoder_activation: str,
+        image_output_scale: float,
+        image_output_shift: float,
+        cdib_cls: type[nn.Module],
+        cdib_levels: Optional[Sequence[int]],
+        cdib_dropout: float,
+        seg_init_from_image: bool,
+        seg_output_bias: float,
+        zero_init_cdib_outputs: bool,
+        cdib_initial_scale: float,
     ):
         super().__init__()
         self.z_channels = int(z_channels)
         self.a_tex_channels = int(a_tex_channels)
         self.in_channels = int(in_channels)
         self.seg_channels = int(seg_channels)
+        self.resolution = int(resolution)
         self.ch = int(ch)
-        self.ch_mult = tuple(int(x) for x in ch_mult)
-        self.num_res_blocks = tuple(int(x) for x in num_res_blocks)
+        self.ch_mult = _as_tuple(ch_mult, "ch_mult")
+        self.num_res_blocks = _as_tuple(num_res_blocks, "num_res_blocks")
         if len(self.ch_mult) != len(self.num_res_blocks):
             raise ValueError("ch_mult and num_res_blocks must have the same length")
 
         self.decoder_activation = str(decoder_activation)
-        self.image_latent_shift_factor = image_latent_shift_factor
-        self.image_latent_scaling_factor = image_latent_scaling_factor
         self.image_output_scale = float(image_output_scale)
         self.image_output_shift = float(image_output_shift)
         self.seg_init_from_image = bool(seg_init_from_image)
@@ -173,45 +192,15 @@ class JointSegDecoder(nn.Module):
                 f"decoder block_in={block_in} (ch*ch_mult[-1])"
             )
 
-        decoder_cls = _locate(decoder_target)
-        decoder_common = dict(decoder_kwargs)
-        decoder_common.update(
-            {
-                "resolution": resolution,
-                "ch": ch,
-                "ch_mult": self.ch_mult,
-                "num_res_blocks": self.num_res_blocks,
-            }
-        )
-
-        self.image_post_quant_conv = None
-        if image_post_quant_conv:
-            embed_dim = int(image_embed_dim if image_embed_dim is not None else z_channels)
-            self.image_post_quant_conv = nn.Conv2d(embed_dim, z_channels, kernel_size=1)
-
-        self.image_decoder = decoder_cls(
-            z_channels=z_channels,
-            in_channels=in_channels,
-            out_ch=in_channels,
-            **decoder_common,
-        )
-        self.seg_decoder = decoder_cls(
-            z_channels=a_tex_channels,
-            in_channels=seg_channels,
-            out_ch=seg_channels,
-            **decoder_common,
-        )
-
         num_resolutions = len(self.ch_mult)
         if cdib_levels is None:
             cdib_levels = list(range(num_resolutions - 1, 0, -1))
         self.cdib_levels = [int(x) for x in cdib_levels]
-        dropout = float(decoder_kwargs.get("dropout", 0.0))
         self.cdib = nn.ModuleDict(
             {
-                str(lvl): CDIB(
-                    ch * self.ch_mult[lvl],
-                    dropout=dropout,
+                str(lvl): cdib_cls(
+                    self.ch * self.ch_mult[lvl],
+                    dropout=cdib_dropout,
                     zero_init_outputs=self.zero_init_cdib_outputs,
                     initial_scale=self.cdib_initial_scale,
                 )
@@ -219,6 +208,7 @@ class JointSegDecoder(nn.Module):
             }
         )
 
+    def _finish_initialization(self, image_checkpoint: Optional[str]) -> None:
         if image_checkpoint:
             self._load_image_checkpoint(image_checkpoint)
         self._init_segmentation_branch()
@@ -239,6 +229,7 @@ class JointSegDecoder(nn.Module):
         if isinstance(sd, dict) and "state_dict" in sd:
             sd = sd["state_dict"]
 
+        image_post_quant_conv = getattr(self, "image_post_quant_conv", None)
         prefixed = {}
         for key, value in sd.items():
             key = _strip_module_prefix(str(key))
@@ -246,7 +237,7 @@ class JointSegDecoder(nn.Module):
                 prefixed[key] = value
             elif (
                 key.startswith("image_post_quant_conv.")
-                and self.image_post_quant_conv is not None
+                and image_post_quant_conv is not None
             ):
                 prefixed[key] = value
             elif key.startswith("decoder."):
@@ -255,7 +246,7 @@ class JointSegDecoder(nn.Module):
                 prefixed[f"image_decoder.{key[len('model.'):]}"] = value
             elif (
                 key.startswith("post_quant_conv.")
-                and self.image_post_quant_conv is not None
+                and image_post_quant_conv is not None
             ):
                 prefixed[
                     f"image_post_quant_conv.{key[len('post_quant_conv.'):]}"
@@ -267,7 +258,7 @@ class JointSegDecoder(nn.Module):
 
         missing, unexpected = self.load_state_dict(prefixed, strict=False)
         print(
-            f"[JointSegDecoder] loaded image checkpoint from {path}; "
+            f"[{type(self).__name__}] loaded image checkpoint from {path}; "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
 
@@ -330,14 +321,7 @@ class JointSegDecoder(nn.Module):
         return a_spatial.contiguous()
 
     def _prepare_image_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        image_latent = latent
-        if self.image_latent_scaling_factor is not None:
-            image_latent = image_latent / float(self.image_latent_scaling_factor)
-        if self.image_latent_shift_factor is not None:
-            image_latent = image_latent + float(self.image_latent_shift_factor)
-        if self.image_post_quant_conv is not None:
-            image_latent = self.image_post_quant_conv(image_latent)
-        return image_latent
+        return latent
 
     def forward(self, latent: torch.Tensor, a_tex: torch.Tensor) -> dict[str, torch.Tensor]:
         a_spatial = self._a_tex_to_spatial(a_tex, latent.shape)
@@ -400,4 +384,187 @@ class JointSegDecoder(nn.Module):
                 modules.extend(level.attn)
             modules.extend([dec.mid.block_1, dec.mid.attn_1, dec.mid.block_2])
         modules.extend(list(self.cdib.values()))
+        image_post_quant_conv = getattr(self, "image_post_quant_conv", None)
+        if image_post_quant_conv is not None:
+            modules.append(image_post_quant_conv)
         return modules
+
+
+class JointSegDecoderF16C64(_JointSegDecoderBase):
+    """JSD for the F16C64 NPU VAE decoder."""
+
+    def __init__(
+        self,
+        z_channels: int,
+        a_tex_channels: int,
+        resolution: int = 512,
+        ch: int = 128,
+        ch_mult: Sequence[int] = _F16_CH_MULT,
+        num_res_blocks: Sequence[int] = _F16_NUM_RES_BLOCKS,
+        in_channels: int = 3,
+        seg_channels: int = 1,
+        decoder_activation: str = "silu",
+        image_output_scale: float = 1.0 / SCALING_FACTOR,
+        image_output_shift: float = SHIFTING_FACTOR,
+        cdib_levels: Optional[Sequence[int]] = None,
+        image_checkpoint: Optional[str] = None,
+        seg_init_from_image: bool = True,
+        seg_output_bias: float = -4.0,
+        zero_init_cdib_outputs: bool = True,
+        cdib_initial_scale: float = 1.0,
+        **decoder_kwargs: Any,
+    ):
+        decoder_kwargs = dict(decoder_kwargs)
+        _reject_params(
+            decoder_kwargs,
+            {
+                "decoder_target",
+                "image_post_quant_conv",
+                "image_embed_dim",
+                "image_latent_shift_factor",
+                "image_latent_scaling_factor",
+                "embed_dim",
+                "shift_factor",
+                "scaling_factor",
+            },
+            type(self).__name__,
+        )
+        ch_mult_tuple = _as_tuple(ch_mult, "ch_mult")
+        num_res_blocks_tuple = _as_tuple(num_res_blocks, "num_res_blocks")
+        if ch_mult_tuple != _F16_CH_MULT or num_res_blocks_tuple != _F16_NUM_RES_BLOCKS:
+            raise ValueError(
+                "JointSegDecoderF16C64 uses the fixed F16C64 VAE layout: "
+                f"ch_mult={_F16_CH_MULT}, num_res_blocks={_F16_NUM_RES_BLOCKS}"
+            )
+
+        super().__init__(
+            z_channels=z_channels,
+            a_tex_channels=a_tex_channels,
+            resolution=resolution,
+            ch=ch,
+            ch_mult=ch_mult_tuple,
+            num_res_blocks=num_res_blocks_tuple,
+            in_channels=in_channels,
+            seg_channels=seg_channels,
+            decoder_activation=decoder_activation,
+            image_output_scale=image_output_scale,
+            image_output_shift=image_output_shift,
+            cdib_cls=CDIBF16C64,
+            cdib_levels=cdib_levels,
+            cdib_dropout=float(decoder_kwargs.get("dropout", 0.0)),
+            seg_init_from_image=seg_init_from_image,
+            seg_output_bias=seg_output_bias,
+            zero_init_cdib_outputs=zero_init_cdib_outputs,
+            cdib_initial_scale=cdib_initial_scale,
+        )
+        self.image_post_quant_conv = None
+        self.image_decoder = mj64_vae.Decoder(
+            z_channels=z_channels,
+            resolution=resolution,
+            ch=ch,
+            in_channels=in_channels,
+            **decoder_kwargs,
+        )
+        self.seg_decoder = mj64_vae.Decoder(
+            z_channels=a_tex_channels,
+            resolution=resolution,
+            ch=ch,
+            in_channels=seg_channels,
+            **decoder_kwargs,
+        )
+        self._finish_initialization(image_checkpoint)
+
+
+class JointSegDecoderF8C32(_JointSegDecoderBase):
+    """JSD for the F8C32 Swin VAE decoder."""
+
+    def __init__(
+        self,
+        z_channels: int,
+        a_tex_channels: int,
+        resolution: int = 256,
+        ch: int = 128,
+        ch_mult: Sequence[int] = _F8_CH_MULT,
+        num_res_blocks: Sequence[int] = _F8_NUM_RES_BLOCKS,
+        in_channels: int = 3,
+        seg_channels: int = 1,
+        embed_dim: int = 32,
+        shift_factor: float = f8c32_swin.SHIFT_FACTOR,
+        scaling_factor: float = f8c32_swin.SCALING_FACTOR,
+        decoder_activation: str = "swish",
+        image_output_scale: float = 1.0,
+        image_output_shift: float = 0.0,
+        cdib_levels: Optional[Sequence[int]] = None,
+        image_checkpoint: Optional[str] = None,
+        seg_init_from_image: bool = True,
+        seg_output_bias: float = -4.0,
+        zero_init_cdib_outputs: bool = True,
+        cdib_initial_scale: float = 1.0,
+        **decoder_kwargs: Any,
+    ):
+        decoder_kwargs = dict(decoder_kwargs)
+        _reject_params(
+            decoder_kwargs,
+            {
+                "decoder_target",
+                "image_post_quant_conv",
+                "image_embed_dim",
+                "image_latent_shift_factor",
+                "image_latent_scaling_factor",
+            },
+            type(self).__name__,
+        )
+        super().__init__(
+            z_channels=z_channels,
+            a_tex_channels=a_tex_channels,
+            resolution=resolution,
+            ch=ch,
+            ch_mult=ch_mult,
+            num_res_blocks=num_res_blocks,
+            in_channels=in_channels,
+            seg_channels=seg_channels,
+            decoder_activation=decoder_activation,
+            image_output_scale=image_output_scale,
+            image_output_shift=image_output_shift,
+            cdib_cls=CDIBF8C32,
+            cdib_levels=cdib_levels,
+            cdib_dropout=float(decoder_kwargs.get("dropout", 0.0)),
+            seg_init_from_image=seg_init_from_image,
+            seg_output_bias=seg_output_bias,
+            zero_init_cdib_outputs=zero_init_cdib_outputs,
+            cdib_initial_scale=cdib_initial_scale,
+        )
+        self.embed_dim = int(embed_dim)
+        self.shift_factor = float(shift_factor)
+        self.scaling_factor = float(scaling_factor)
+        self.image_post_quant_conv = nn.Conv2d(self.embed_dim, z_channels, kernel_size=1)
+        self.image_decoder = f8c32_swin.Decoder(
+            z_channels=z_channels,
+            resolution=resolution,
+            ch=ch,
+            ch_mult=self.ch_mult,
+            num_res_blocks=self.num_res_blocks,
+            in_channels=in_channels,
+            out_ch=in_channels,
+            **decoder_kwargs,
+        )
+        self.seg_decoder = f8c32_swin.Decoder(
+            z_channels=a_tex_channels,
+            resolution=resolution,
+            ch=ch,
+            ch_mult=self.ch_mult,
+            num_res_blocks=self.num_res_blocks,
+            in_channels=seg_channels,
+            out_ch=seg_channels,
+            **decoder_kwargs,
+        )
+        self._finish_initialization(image_checkpoint)
+
+    def _prepare_image_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        z = latent / self.scaling_factor + self.shift_factor
+        return self.image_post_quant_conv(z)
+
+
+# Backward-compatible F16 name. New configs should use the explicit classes.
+CDIB = CDIBF16C64
+JointSegDecoder = JointSegDecoderF16C64

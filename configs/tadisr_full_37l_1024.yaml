@@ -137,7 +137,7 @@ components:
     gradient_checkpointing: true
 
   jsd:
-    target: models.vae.npu.jsd.JointSegDecoder
+    target: models.vae.npu.jsd.JointSegDecoderF16C64
     params:
       z_channels: 64
       a_tex_channels: 64
